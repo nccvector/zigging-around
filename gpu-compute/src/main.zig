@@ -2,6 +2,7 @@ const std = @import("std");
 const mtl = @cImport({
     @cInclude("metal_wrapper.h");
 });
+const zmtl = @import("metal.zig");
 
 pub fn main() !void {
 
@@ -352,64 +353,23 @@ test "lesson_01_hello_compute" {
 
     const array_len: usize = 16_000_000;
 
-    const device = mtl.MTLWrapperCreateSystemDefaultDevice() orelse {
-        std.debug.print("Metal device not available\n", .{});
-        return error.MetalDeviceCreationFailure;
-    };
+    const device = try zmtl.Device.default();
+    const library = try device.createLibrary(shader_source);
+    const pipeline = try library.createComputePipeline("hello");
+    const buffer = try device.createBuffer(f32, array_len);
+    const queue = try device.createCommandQueue();
 
-    var compile_error: mtl.NSErrorRef = null;
-    const library = mtl.MTLDeviceNewLibraryWithSource(device, shader_source, null, &compile_error) orelse {
-        const desc: [*c]const u8 = mtl.NSErrorLocalizedDescription(compile_error) orelse "(unknown error)";
-        std.debug.print("Failed to compile shader: {s}", .{desc});
-        return error.ShaderCompilationFailed;
-    };
+    const threads_per_group = pipeline.maxThreadsPerThreadGroup();
+    const num_groups = (array_len + threads_per_group - 1) / threads_per_group;
 
-    const hello = mtl.MTLLibraryNewFunctionWithName(library, "hello") orelse {
-        std.debug.print("Failed to get hello kernel", .{});
-        return error.KernelCreationFailed;
-    };
+    var command = try pipeline.begin(queue);
+    command.setBuffer(f32, buffer, 0, 0);
+    command.dispatch(zmtl.Size.init1d(num_groups), zmtl.Size.init1d(threads_per_group));
+    command.submit();
 
-    var pipeline_error: mtl.NSErrorRef = null;
-    const hello_pipeline = mtl.MTLDeviceNewComputePipelineStateWithFunction(device, hello, &pipeline_error) orelse {
-        const desc: [*c]const u8 = mtl.NSErrorLocalizedDescription(compile_error) orelse "(unknown error)";
-        std.debug.print("Failed to create pipeline state: {s}", .{desc});
-        return error.HelloPipelineCreationFailure;
-    };
-
-    const buffer = mtl.MTLDeviceNewBufferWithLength(device, array_len * @sizeOf(f32), 0) orelse {
-        std.debug.print("Failed to create buffer", .{});
-        return error.BufferCreationFailure;
-    };
-
-    const queue = mtl.MTLDeviceNewCommandQueue(device) orelse {
-        std.debug.print("Failed to create command queue", .{});
-        return error.CommandQueueCreationFailure;
-    };
-
-    const command = mtl.MTLCommandQueueCommandBuffer(queue) orelse return error.CommandCreationFailure;
-
-    const encoder = mtl.MTLCommandBufferComputeCommandEncoder(command) orelse return error.CommandEncoderCreationFailure;
-
-    mtl.MTLComputeCommandEncoderSetComputePipelineState(encoder, hello_pipeline);
-
-    mtl.MTLComputeCommandEncoderSetBuffer(encoder, buffer, 0, 0);
-
-    const max_threads = mtl.MTLComputePipelineStateMaxTotalThreadsPerThreadgroup(hello_pipeline);
-    const num_groups = try std.math.divCeil(u64, array_len, max_threads);
-    const groups = mtl.MTLSize{ .width = num_groups, .height = 1, .depth = 1 };
-    const threads_per_group = mtl.MTLSize{ .width = max_threads, .height = 1, .depth = 1 };
-    mtl.MTLComputeCommandEncoderDispatchThreadgroups(
-        encoder,
-        groups,
-        threads_per_group,
-    );
-
-    mtl.MTLComputeCommandEncoderEndEncoding(encoder);
-    mtl.MTLCommandBufferCommit(command);
-    mtl.MTLCommandBufferWaitUntilCompleted(command);
-
-    const output: [*]f32 = @ptrCast(@alignCast(mtl.MTLBufferContents(buffer)));
-    for (0..array_len) |i| {
-        try std.testing.expectEqual(@as(f32, 42.0), output[i]);
+    // Verify
+    const output = buffer.contents();
+    for (output) |val| {
+        try std.testing.expectEqual(@as(f32, 42.0), val);
     }
 }
