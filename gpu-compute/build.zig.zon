@@ -1,0 +1,20 @@
+.{
+    .fingerprint = 0xbfc3ab3691190322,
+    .name = .gpu_compute,
+    .version = "0.1.0",
+    .dependencies = .{
+        // metal-cpp from a git-friendly mirror
+        // When you first run `zig build`, it will fail and tell you the correct hash.
+        // Replace the placeholder hash below with the one Zig provides.
+        .metal_cpp = .{
+            .url = "https://github.com/bkaradzic/metal-cpp/archive/refs/heads/master.tar.gz",
+            // This is a placeholder - Zig will tell you the correct hash on first build
+            .hash = "N-V-__8AAKnTFwBK9BYjWyNYlyMM8AveHxRBMDNgiF6QqHCS",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
