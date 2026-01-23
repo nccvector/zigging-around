@@ -539,395 +539,26 @@ pub const Texture = struct {
 // Comptime Command Builder API
 // =============================================================================
 
-/// Operation types for comptime command building
-const Op = enum {
-    switch_to_compute_serial,
-    switch_to_compute_concurrent,
-    switch_to_blit,
-    switch_to_accel,
-    set_pipeline,
-    set_buffer,
-    set_bytes,
-    set_texture,
-    set_accel_struct,
-    dispatch,
-    dispatch_2d,
-    barrier,
-    copy,
-    fill,
-    build_accel,
-    refit_accel,
-    copy_accel,
-    compact_accel,
-    signal_event,
-    wait_event,
-};
+const EncoderKind = enum { compute, blit };
 
-/// Comptime command builder - generates optimal code at compile time
-/// Each method returns a new type with the operation appended.
-///
-/// Usage:
-///   device.submit(
-///       cmd.compute(pipeline, .{})
-///          .setBuffer(buf_a, 0, .{})
-///          .setBuffer(buf_b, 1, .{})
-///          .dispatch(grid, threads)
-///   );
-pub fn Command(comptime ops: []const Op) type {
-    return struct {
-        // Runtime data stored per-operation
-        data: Data,
+// Data types - the type itself identifies the operation
+const PipelineBinding = struct { handle: mtl.MTLComputePipelineStateRef };
+const BufferBinding = struct { handle: mtl.MTLBufferRef, offset: u64, index: u64 };
+const TextureBinding = struct { handle: mtl.MTLTextureRef, index: u64 };
+const BytesBinding = struct { ptr: *const anyopaque, len: usize, index: u64 };
+const DispatchInfo = struct { grid: Size, threads: Size };
+const Dispatch2dInfo = struct { width: u64, height: u64 };
+const BarrierInfo = struct { scope: BarrierScope };
+const CopyInfo = struct { src: mtl.MTLBufferRef, src_offset: u64, dst: mtl.MTLBufferRef, dst_offset: u64, size: u64 };
+const FillInfo = struct { buffer: mtl.MTLBufferRef, offset: u64, size: u64, value: u8 };
 
-        const Self = @This();
-        const ops_list = ops;
-
-        /// Runtime data structure - holds handles/values for each op
-        const Data = GenerateDataStruct(ops);
-
-        pub fn init() Self {
-            return .{ .data = undefined };
-        }
-
-        /// Copy data fields from self to result by iterating over ops (comptime-known)
-        fn copyDataTo(self: *const Self, comptime ResultType: type, result: *ResultType) void {
-            inline for (ops, 0..) |op, i| {
-                switch (op) {
-                    .set_pipeline => @field(result.data, pipelineFieldName(i)) = @field(self.data, pipelineFieldName(i)),
-                    .set_buffer => @field(result.data, bufferFieldName(i)) = @field(self.data, bufferFieldName(i)),
-                    .set_texture => @field(result.data, textureFieldName(i)) = @field(self.data, textureFieldName(i)),
-                    .set_bytes => @field(result.data, bytesFieldName(i)) = @field(self.data, bytesFieldName(i)),
-                    .set_accel_struct => @field(result.data, accelStructFieldName(i)) = @field(self.data, accelStructFieldName(i)),
-                    .dispatch => @field(result.data, dispatchFieldName(i)) = @field(self.data, dispatchFieldName(i)),
-                    .dispatch_2d => @field(result.data, dispatch2dFieldName(i)) = @field(self.data, dispatch2dFieldName(i)),
-                    .barrier => @field(result.data, barrierFieldName(i)) = @field(self.data, barrierFieldName(i)),
-                    .copy => @field(result.data, copyFieldName(i)) = @field(self.data, copyFieldName(i)),
-                    .fill => @field(result.data, fillFieldName(i)) = @field(self.data, fillFieldName(i)),
-                    .build_accel => @field(result.data, buildAccelFieldName(i)) = @field(self.data, buildAccelFieldName(i)),
-                    // Ops without runtime data
-                    .switch_to_compute_serial, .switch_to_compute_concurrent, .switch_to_blit, .switch_to_accel, .refit_accel, .copy_accel, .compact_accel, .signal_event, .wait_event => {},
-                }
-            }
-        }
-
-        // =====================================================================
-        // Compute Operations
-        // =====================================================================
-
-        /// Start a serial compute encoder (dispatches execute sequentially)
-        pub fn compute(self: Self, pipeline: ComputePipeline) Command(ops ++ &[_]Op{ .switch_to_compute_serial, .set_pipeline }) {
-            var result: Command(ops ++ &[_]Op{ .switch_to_compute_serial, .set_pipeline }) = .{ .data = undefined };
-            self.copyDataTo(@TypeOf(result), &result);
-            @field(result.data, pipelineFieldName(ops.len + 1)) = pipeline.handle;
-            return result;
-        }
-
-        /// Start a concurrent compute encoder (dispatches can overlap, needs barriers)
-        pub fn computeConcurrent(self: Self, pipeline: ComputePipeline) Command(ops ++ &[_]Op{ .switch_to_compute_concurrent, .set_pipeline }) {
-            var result: Command(ops ++ &[_]Op{ .switch_to_compute_concurrent, .set_pipeline }) = .{ .data = undefined };
-            self.copyDataTo(@TypeOf(result), &result);
-            @field(result.data, pipelineFieldName(ops.len + 1)) = pipeline.handle;
-            return result;
-        }
-
-        pub fn setBuffer(self: Self, buffer: anytype, index: u64, opts: struct { offset: u64 = 0 }) Command(ops ++ &[_]Op{.set_buffer}) {
-            const handle = if (@hasField(@TypeOf(buffer), "handle")) buffer.handle else buffer;
-            var result: Command(ops ++ &[_]Op{.set_buffer}) = .{ .data = undefined };
-            self.copyDataTo(@TypeOf(result), &result);
-            @field(result.data, bufferFieldName(ops.len)) = .{ .handle = handle, .offset = opts.offset, .index = index };
-            return result;
-        }
-
-        pub fn setTexture(self: Self, texture: Texture, index: u64) Command(ops ++ &[_]Op{.set_texture}) {
-            var result: Command(ops ++ &[_]Op{.set_texture}) = .{ .data = undefined };
-            self.copyDataTo(@TypeOf(result), &result);
-            @field(result.data, textureFieldName(ops.len)) = .{ .handle = texture.handle, .index = index };
-            return result;
-        }
-
-        pub fn setBytes(self: Self, data: anytype, index: u64) Command(ops ++ &[_]Op{.set_bytes}) {
-            var result: Command(ops ++ &[_]Op{.set_bytes}) = .{ .data = undefined };
-            self.copyDataTo(@TypeOf(result), &result);
-            const T = @TypeOf(data);
-            const bytes_ptr = if (@typeInfo(T) == .pointer) data else &data;
-            @field(result.data, bytesFieldName(ops.len)) = .{ .ptr = @ptrCast(bytes_ptr), .len = @sizeOf(std.meta.Child(if (@typeInfo(T) == .pointer) T else *const T)), .index = index };
-            return result;
-        }
-
-        pub fn dispatch(self: Self, grid: Size, threads_per_group: Size) Command(ops ++ &[_]Op{.dispatch}) {
-            var result: Command(ops ++ &[_]Op{.dispatch}) = .{ .data = undefined };
-            self.copyDataTo(@TypeOf(result), &result);
-            @field(result.data, dispatchFieldName(ops.len)) = .{ .grid = grid, .threads = threads_per_group };
-            return result;
-        }
-
-        pub fn dispatch2d(self: Self, width: u64, height: u64) Command(ops ++ &[_]Op{.dispatch_2d}) {
-            var result: Command(ops ++ &[_]Op{.dispatch_2d}) = .{ .data = undefined };
-            self.copyDataTo(@TypeOf(result), &result);
-            @field(result.data, dispatch2dFieldName(ops.len)) = .{ .width = width, .height = height };
-            return result;
-        }
-
-        pub fn dispatch1d(self: Self, pipeline: ComputePipeline, element_count: usize) Command(ops ++ &[_]Op{.dispatch}) {
-            const grid, const threads = pipeline.gridFor1d(element_count);
-            return self.dispatch(grid, threads);
-        }
-
-        pub fn barrier(self: Self, scope: BarrierScope) Command(ops ++ &[_]Op{.barrier}) {
-            var result: Command(ops ++ &[_]Op{.barrier}) = .{ .data = undefined };
-            self.copyDataTo(@TypeOf(result), &result);
-            @field(result.data, barrierFieldName(ops.len)) = scope;
-            return result;
-        }
-
-        // =====================================================================
-        // Blit Operations
-        // =====================================================================
-
-        pub fn blit(self: Self) Command(ops ++ &[_]Op{.switch_to_blit}) {
-            var result: Command(ops ++ &[_]Op{.switch_to_blit}) = .{ .data = undefined };
-            self.copyDataTo(@TypeOf(result), &result);
-            return result;
-        }
-
-        pub fn copy(self: Self, src: anytype, dst: anytype, size: u64, opts: struct { src_offset: u64 = 0, dst_offset: u64 = 0 }) Command(ops ++ &[_]Op{.copy}) {
-            const src_handle = if (@hasField(@TypeOf(src), "handle")) src.handle else src;
-            const dst_handle = if (@hasField(@TypeOf(dst), "handle")) dst.handle else dst;
-            var result: Command(ops ++ &[_]Op{.copy}) = .{ .data = undefined };
-            self.copyDataTo(@TypeOf(result), &result);
-            @field(result.data, copyFieldName(ops.len)) = .{ .src = src_handle, .src_offset = opts.src_offset, .dst = dst_handle, .dst_offset = opts.dst_offset, .size = size };
-            return result;
-        }
-
-        pub fn fill(self: Self, buffer: anytype, value: u8, size: u64, opts: struct { offset: u64 = 0 }) Command(ops ++ &[_]Op{.fill}) {
-            const handle = if (@hasField(@TypeOf(buffer), "handle")) buffer.handle else buffer;
-            var result: Command(ops ++ &[_]Op{.fill}) = .{ .data = undefined };
-            self.copyDataTo(@TypeOf(result), &result);
-            @field(result.data, fillFieldName(ops.len)) = .{ .buffer = handle, .offset = opts.offset, .size = size, .value = value };
-            return result;
-        }
-
-        // =====================================================================
-        // Acceleration Structure Operations
-        // =====================================================================
-
-        pub fn accel(self: Self) Command(ops ++ &[_]Op{.switch_to_accel}) {
-            var result: Command(ops ++ &[_]Op{.switch_to_accel}) = .{ .data = undefined };
-            self.copyDataTo(@TypeOf(result), &result);
-            return result;
-        }
-
-        pub fn buildAccelerationStructure(
-            self: Self,
-            acceleration_structure: AccelerationStructure,
-            descriptor: anytype,
-            scratch_buffer: anytype,
-            opts: struct { scratch_offset: u64 = 0 },
-        ) Command(ops ++ &[_]Op{.build_accel}) {
-            const desc_handle = if (@hasField(@TypeOf(descriptor), "handle")) descriptor.handle else descriptor;
-            const scratch_handle = if (@hasField(@TypeOf(scratch_buffer), "handle")) scratch_buffer.handle else scratch_buffer;
-            var result: Command(ops ++ &[_]Op{.build_accel}) = .{ .data = undefined };
-            self.copyDataTo(@TypeOf(result), &result);
-            @field(result.data, buildAccelFieldName(ops.len)) = .{
-                .accel = acceleration_structure.handle,
-                .descriptor = desc_handle,
-                .scratch = scratch_handle,
-                .scratch_offset = opts.scratch_offset,
-            };
-            return result;
-        }
-
-        pub fn setAccelerationStructure(self: Self, accel_struct: AccelerationStructure, index: u64) Command(ops ++ &[_]Op{.set_accel_struct}) {
-            var result: Command(ops ++ &[_]Op{.set_accel_struct}) = .{ .data = undefined };
-            self.copyDataTo(@TypeOf(result), &result);
-            @field(result.data, accelStructFieldName(ops.len)) = .{ .handle = accel_struct.handle, .index = index };
-            return result;
-        }
-
-        // =====================================================================
-        // Finalize - generates inline Metal calls
-        // =====================================================================
-
-        pub inline fn finalize(self: *const Self, queue: mtl.MTLCommandQueueRef) mtl.MTLCommandBufferRef {
-            const cmd_buf = mtl.MTLCommandQueueCommandBuffer(queue) orelse @panic("Failed to create command buffer");
-
-            var compute_enc: ?mtl.MTLComputeCommandEncoderRef = null;
-            var blit_enc: ?mtl.MTLBlitCommandEncoderRef = null;
-            var accel_enc: ?mtl.MTLAccelerationStructureCommandEncoderRef = null;
-
-            inline for (ops, 0..) |op, i| {
-                switch (op) {
-                    .switch_to_compute_serial => {
-                        if (blit_enc) |e| {
-                            mtl.MTLBlitCommandEncoderEndEncoding(e);
-                            blit_enc = null;
-                        }
-                        if (accel_enc) |e| {
-                            mtl.MTLAccelerationStructureCommandEncoderEndEncoding(e);
-                            accel_enc = null;
-                        }
-                        if (compute_enc == null) {
-                            compute_enc = mtl.MTLCommandBufferComputeCommandEncoder(cmd_buf);
-                        }
-                    },
-                    .switch_to_compute_concurrent => {
-                        if (blit_enc) |e| {
-                            mtl.MTLBlitCommandEncoderEndEncoding(e);
-                            blit_enc = null;
-                        }
-                        if (accel_enc) |e| {
-                            mtl.MTLAccelerationStructureCommandEncoderEndEncoding(e);
-                            accel_enc = null;
-                        }
-                        if (compute_enc == null) {
-                            compute_enc = mtl.MTLCommandBufferComputeCommandEncoderWithDispatchType(cmd_buf, mtl.MTLDispatchTypeConcurrent);
-                        }
-                    },
-                    .switch_to_blit => {
-                        if (compute_enc) |e| {
-                            mtl.MTLComputeCommandEncoderEndEncoding(e);
-                            compute_enc = null;
-                        }
-                        if (accel_enc) |e| {
-                            mtl.MTLAccelerationStructureCommandEncoderEndEncoding(e);
-                            accel_enc = null;
-                        }
-                        if (blit_enc == null) {
-                            blit_enc = mtl.MTLCommandBufferBlitCommandEncoder(cmd_buf);
-                        }
-                    },
-                    .switch_to_accel => {
-                        if (compute_enc) |e| {
-                            mtl.MTLComputeCommandEncoderEndEncoding(e);
-                            compute_enc = null;
-                        }
-                        if (blit_enc) |e| {
-                            mtl.MTLBlitCommandEncoderEndEncoding(e);
-                            blit_enc = null;
-                        }
-                        if (accel_enc == null) {
-                            accel_enc = mtl.MTLCommandBufferAccelerationStructureCommandEncoder(cmd_buf);
-                        }
-                    },
-                    .set_pipeline => {
-                        const handle = @field(self.data, pipelineFieldName(i));
-                        mtl.MTLComputeCommandEncoderSetComputePipelineState(compute_enc.?, handle);
-                    },
-                    .set_buffer => {
-                        const d = @field(self.data, bufferFieldName(i));
-                        mtl.MTLComputeCommandEncoderSetBuffer(compute_enc.?, d.handle, d.offset, d.index);
-                    },
-                    .set_texture => {
-                        const d = @field(self.data, textureFieldName(i));
-                        mtl.MTLComputeCommandEncoderSetTexture(compute_enc.?, d.handle, d.index);
-                    },
-                    .set_bytes => {
-                        const d = @field(self.data, bytesFieldName(i));
-                        mtl.MTLComputeCommandEncoderSetBytes(compute_enc.?, d.ptr, d.len, d.index);
-                    },
-                    .set_accel_struct => {
-                        const d = @field(self.data, accelStructFieldName(i));
-                        mtl.MTLComputeCommandEncoderSetAccelerationStructure(compute_enc.?, d.handle, d.index);
-                    },
-                    .dispatch => {
-                        const d = @field(self.data, dispatchFieldName(i));
-                        mtl.MTLComputeCommandEncoderDispatchThreadgroups(
-                            compute_enc.?,
-                            mtl.MTLSize{ .width = d.grid.width, .height = d.grid.height, .depth = d.grid.depth },
-                            mtl.MTLSize{ .width = d.threads.width, .height = d.threads.height, .depth = d.threads.depth },
-                        );
-                    },
-                    .dispatch_2d => {
-                        const d = @field(self.data, dispatch2dFieldName(i));
-                        const grid_w = (d.width + 15) / 16;
-                        const grid_h = (d.height + 15) / 16;
-                        mtl.MTLComputeCommandEncoderDispatchThreadgroups(
-                            compute_enc.?,
-                            mtl.MTLSize{ .width = grid_w, .height = grid_h, .depth = 1 },
-                            mtl.MTLSize{ .width = 16, .height = 16, .depth = 1 },
-                        );
-                    },
-                    .barrier => {
-                        const scope = @field(self.data, barrierFieldName(i));
-                        mtl.MTLComputeCommandEncoderMemoryBarrierWithScope(compute_enc.?, @intFromEnum(scope));
-                    },
-                    .copy => {
-                        const d = @field(self.data, copyFieldName(i));
-                        mtl.MTLBlitCommandEncoderCopyFromBuffer(blit_enc.?, d.src, d.src_offset, d.dst, d.dst_offset, d.size);
-                    },
-                    .fill => {
-                        const d = @field(self.data, fillFieldName(i));
-                        mtl.MTLBlitCommandEncoderFillBuffer(blit_enc.?, d.buffer, d.offset, d.size, d.value);
-                    },
-                    .build_accel => {
-                        const d = @field(self.data, buildAccelFieldName(i));
-                        mtl.MTLAccelerationStructureCommandEncoderBuildAccelerationStructure(accel_enc.?, d.accel, d.descriptor, d.scratch, d.scratch_offset);
-                    },
-                    .refit_accel, .copy_accel, .compact_accel, .signal_event, .wait_event => {
-                        // TODO: implement these as needed
-                    },
-                }
-            }
-
-            // End active encoders
-            if (compute_enc) |e| mtl.MTLComputeCommandEncoderEndEncoding(e);
-            if (blit_enc) |e| mtl.MTLBlitCommandEncoderEndEncoding(e);
-            if (accel_enc) |e| mtl.MTLAccelerationStructureCommandEncoderEndEncoding(e);
-
-            mtl.MTLCommandBufferCommit(cmd_buf);
-            return cmd_buf;
-        }
-    };
+fn fieldName(comptime i: usize) [:0]const u8 {
+    return std.fmt.comptimePrint("f{d}", .{i});
 }
 
-// Field name generators for unique field names per operation index
-fn pipelineFieldName(comptime i: usize) [:0]const u8 {
-    return std.fmt.comptimePrint("pipeline_{d}", .{i});
-}
-fn bufferFieldName(comptime i: usize) [:0]const u8 {
-    return std.fmt.comptimePrint("buffer_{d}", .{i});
-}
-fn textureFieldName(comptime i: usize) [:0]const u8 {
-    return std.fmt.comptimePrint("texture_{d}", .{i});
-}
-fn bytesFieldName(comptime i: usize) [:0]const u8 {
-    return std.fmt.comptimePrint("bytes_{d}", .{i});
-}
-fn dispatchFieldName(comptime i: usize) [:0]const u8 {
-    return std.fmt.comptimePrint("dispatch_{d}", .{i});
-}
-fn dispatch2dFieldName(comptime i: usize) [:0]const u8 {
-    return std.fmt.comptimePrint("dispatch2d_{d}", .{i});
-}
-fn barrierFieldName(comptime i: usize) [:0]const u8 {
-    return std.fmt.comptimePrint("barrier_{d}", .{i});
-}
-fn copyFieldName(comptime i: usize) [:0]const u8 {
-    return std.fmt.comptimePrint("copy_{d}", .{i});
-}
-fn fillFieldName(comptime i: usize) [:0]const u8 {
-    return std.fmt.comptimePrint("fill_{d}", .{i});
-}
-fn buildAccelFieldName(comptime i: usize) [:0]const u8 {
-    return std.fmt.comptimePrint("build_accel_{d}", .{i});
-}
-fn accelStructFieldName(comptime i: usize) [:0]const u8 {
-    return std.fmt.comptimePrint("accel_struct_{d}", .{i});
-}
-
-// Data types for each operation
-const BufferData = struct { handle: mtl.MTLBufferRef, offset: u64, index: u64 };
-const TextureData = struct { handle: mtl.MTLTextureRef, index: u64 };
-const BytesData = struct { ptr: *const anyopaque, len: usize, index: u64 };
-const AccelStructData = struct { handle: mtl.MTLAccelerationStructureRef, index: u64 };
-const DispatchData = struct { grid: Size, threads: Size };
-const Dispatch2dData = struct { width: u64, height: u64 };
-const CopyData = struct { src: mtl.MTLBufferRef, src_offset: u64, dst: mtl.MTLBufferRef, dst_offset: u64, size: u64 };
-const FillData = struct { buffer: mtl.MTLBufferRef, offset: u64, size: u64, value: u8 };
-const BuildAccelData = struct { accel: mtl.MTLAccelerationStructureRef, descriptor: mtl.MTLAccelerationStructureDescriptorRef, scratch: mtl.MTLBufferRef, scratch_offset: u64 };
-
-fn makeField(comptime name: [:0]const u8, comptime T: type) std.builtin.Type.StructField {
+fn makeField(comptime i: usize, comptime T: type) std.builtin.Type.StructField {
     return .{
-        .name = name,
+        .name = fieldName(i),
         .type = T,
         .default_value_ptr = null,
         .is_comptime = false,
@@ -935,31 +566,12 @@ fn makeField(comptime name: [:0]const u8, comptime T: type) std.builtin.Type.Str
     };
 }
 
-/// Generate a struct type holding runtime data for the given ops
-fn GenerateDataStruct(comptime ops: []const Op) type {
+/// Generate a struct type for storing operation data
+fn DataStruct(comptime types: []const type) type {
     var fields: []const std.builtin.Type.StructField = &.{};
-
-    for (ops, 0..) |op, i| {
-        const maybe_field: ?std.builtin.Type.StructField = switch (op) {
-            .set_pipeline => makeField(pipelineFieldName(i), mtl.MTLComputePipelineStateRef),
-            .set_buffer => makeField(bufferFieldName(i), BufferData),
-            .set_texture => makeField(textureFieldName(i), TextureData),
-            .set_bytes => makeField(bytesFieldName(i), BytesData),
-            .set_accel_struct => makeField(accelStructFieldName(i), AccelStructData),
-            .dispatch => makeField(dispatchFieldName(i), DispatchData),
-            .dispatch_2d => makeField(dispatch2dFieldName(i), Dispatch2dData),
-            .barrier => makeField(barrierFieldName(i), BarrierScope),
-            .copy => makeField(copyFieldName(i), CopyData),
-            .fill => makeField(fillFieldName(i), FillData),
-            .build_accel => makeField(buildAccelFieldName(i), BuildAccelData),
-            // Ops that don't need runtime data
-            .switch_to_compute_serial, .switch_to_compute_concurrent, .switch_to_blit, .switch_to_accel, .refit_accel, .copy_accel, .compact_accel, .signal_event, .wait_event => null,
-        };
-        if (maybe_field) |field| {
-            fields = fields ++ &[_]std.builtin.Type.StructField{field};
-        }
+    for (types, 0..) |T, i| {
+        fields = fields ++ &[_]std.builtin.Type.StructField{makeField(i, T)};
     }
-
     return @Type(.{ .@"struct" = .{
         .layout = .auto,
         .fields = fields,
@@ -968,8 +580,232 @@ fn GenerateDataStruct(comptime ops: []const Op) type {
     } });
 }
 
-/// Entry point - start building a command
-pub const cmd = Command(&.{}).init();
+/// Compute command builder - comptime type grows with each operation
+pub fn Compute(comptime types: []const type, comptime concurrent: bool) type {
+    return struct {
+        data: Data,
+        const Self = @This();
+        const Data = DataStruct(types);
+        const n = types.len;
+        pub const encoder_kind: EncoderKind = .compute;
+        pub const is_concurrent = concurrent;
+
+        pub fn init(pipeline: ComputePipeline) Compute(&[_]type{PipelineBinding}, concurrent) {
+            var result: Compute(&[_]type{PipelineBinding}, concurrent) = .{ .data = undefined };
+            @field(result.data, fieldName(0)) = .{ .handle = pipeline.handle };
+            return result;
+        }
+
+        pub fn setPipeline(self: Self, pipeline: ComputePipeline) Compute(types ++ &[_]type{PipelineBinding}, concurrent) {
+            var result: Compute(types ++ &[_]type{PipelineBinding}, concurrent) = .{ .data = undefined };
+            inline for (0..n) |i| @field(result.data, fieldName(i)) = @field(self.data, fieldName(i));
+            @field(result.data, fieldName(n)) = .{ .handle = pipeline.handle };
+            return result;
+        }
+
+        pub fn setBuffer(self: Self, buffer: anytype, index: u64, opts: struct { offset: u64 = 0 }) Compute(types ++ &[_]type{BufferBinding}, concurrent) {
+            const handle = if (@hasField(@TypeOf(buffer), "handle")) buffer.handle else buffer;
+            var result: Compute(types ++ &[_]type{BufferBinding}, concurrent) = .{ .data = undefined };
+            inline for (0..n) |i| @field(result.data, fieldName(i)) = @field(self.data, fieldName(i));
+            @field(result.data, fieldName(n)) = .{ .handle = handle, .offset = opts.offset, .index = index };
+            return result;
+        }
+
+        pub fn setTexture(self: Self, texture: Texture, index: u64) Compute(types ++ &[_]type{TextureBinding}, concurrent) {
+            var result: Compute(types ++ &[_]type{TextureBinding}, concurrent) = .{ .data = undefined };
+            inline for (0..n) |i| @field(result.data, fieldName(i)) = @field(self.data, fieldName(i));
+            @field(result.data, fieldName(n)) = .{ .handle = texture.handle, .index = index };
+            return result;
+        }
+
+        pub fn setBytes(self: Self, bytes: anytype, index: u64) Compute(types ++ &[_]type{BytesBinding}, concurrent) {
+            var result: Compute(types ++ &[_]type{BytesBinding}, concurrent) = .{ .data = undefined };
+            inline for (0..n) |i| @field(result.data, fieldName(i)) = @field(self.data, fieldName(i));
+            const T = @TypeOf(bytes);
+            const ptr = if (@typeInfo(T) == .pointer) bytes else &bytes;
+            @field(result.data, fieldName(n)) = .{ .ptr = @ptrCast(ptr), .len = @sizeOf(std.meta.Child(if (@typeInfo(T) == .pointer) T else *const T)), .index = index };
+            return result;
+        }
+
+        pub fn dispatch(self: Self, grid: Size, threads: Size) Compute(types ++ &[_]type{DispatchInfo}, concurrent) {
+            var result: Compute(types ++ &[_]type{DispatchInfo}, concurrent) = .{ .data = undefined };
+            inline for (0..n) |i| @field(result.data, fieldName(i)) = @field(self.data, fieldName(i));
+            @field(result.data, fieldName(n)) = .{ .grid = grid, .threads = threads };
+            return result;
+        }
+
+        pub fn dispatch1d(self: Self, pipeline: ComputePipeline, count: usize) Compute(types ++ &[_]type{DispatchInfo}, concurrent) {
+            const grid, const threads = pipeline.gridFor1d(count);
+            return self.dispatch(grid, threads);
+        }
+
+        pub fn dispatch2d(self: Self, width: u64, height: u64) Compute(types ++ &[_]type{Dispatch2dInfo}, concurrent) {
+            var result: Compute(types ++ &[_]type{Dispatch2dInfo}, concurrent) = .{ .data = undefined };
+            inline for (0..n) |i| @field(result.data, fieldName(i)) = @field(self.data, fieldName(i));
+            @field(result.data, fieldName(n)) = .{ .width = width, .height = height };
+            return result;
+        }
+
+        pub fn barrier(self: Self, scope: BarrierScope) Compute(types ++ &[_]type{BarrierInfo}, concurrent) {
+            var result: Compute(types ++ &[_]type{BarrierInfo}, concurrent) = .{ .data = undefined };
+            inline for (0..n) |i| @field(result.data, fieldName(i)) = @field(self.data, fieldName(i));
+            @field(result.data, fieldName(n)) = .{ .scope = scope };
+            return result;
+        }
+
+        /// Encode compute commands to an encoder
+        pub fn encode(self: *const Self, enc: mtl.MTLComputeCommandEncoderRef) void {
+            inline for (types, 0..) |T, i| {
+                const val = @field(self.data, fieldName(i));
+                if (T == PipelineBinding) {
+                    mtl.MTLComputeCommandEncoderSetComputePipelineState(enc, val.handle);
+                } else if (T == BufferBinding) {
+                    mtl.MTLComputeCommandEncoderSetBuffer(enc, val.handle, val.offset, val.index);
+                } else if (T == TextureBinding) {
+                    mtl.MTLComputeCommandEncoderSetTexture(enc, val.handle, val.index);
+                } else if (T == BytesBinding) {
+                    mtl.MTLComputeCommandEncoderSetBytes(enc, val.ptr, val.len, val.index);
+                } else if (T == DispatchInfo) {
+                    mtl.MTLComputeCommandEncoderDispatchThreadgroups(
+                        enc,
+                        mtl.MTLSize{ .width = val.grid.width, .height = val.grid.height, .depth = val.grid.depth },
+                        mtl.MTLSize{ .width = val.threads.width, .height = val.threads.height, .depth = val.threads.depth },
+                    );
+                } else if (T == Dispatch2dInfo) {
+                    const grid_w = (val.width + 15) / 16;
+                    const grid_h = (val.height + 15) / 16;
+                    mtl.MTLComputeCommandEncoderDispatchThreadgroups(
+                        enc,
+                        mtl.MTLSize{ .width = grid_w, .height = grid_h, .depth = 1 },
+                        mtl.MTLSize{ .width = 16, .height = 16, .depth = 1 },
+                    );
+                } else if (T == BarrierInfo) {
+                    mtl.MTLComputeCommandEncoderMemoryBarrierWithScope(enc, @intFromEnum(val.scope));
+                }
+            }
+        }
+
+        /// Finalize: create command buffer, encode, commit
+        pub fn finalize(self: *const Self, queue: mtl.MTLCommandQueueRef) mtl.MTLCommandBufferRef {
+            const cmd_buf = mtl.MTLCommandQueueCommandBuffer(queue) orelse @panic("Failed to create command buffer");
+            const enc = if (concurrent)
+                mtl.MTLCommandBufferComputeCommandEncoderWithDispatchType(cmd_buf, mtl.MTLDispatchTypeConcurrent)
+            else
+                mtl.MTLCommandBufferComputeCommandEncoder(cmd_buf);
+            self.encode(enc);
+            mtl.MTLComputeCommandEncoderEndEncoding(enc);
+            mtl.MTLCommandBufferCommit(cmd_buf);
+            return cmd_buf;
+        }
+    };
+}
+
+/// Blit command builder - for memory operations
+pub fn Blit(comptime types: []const type) type {
+    return struct {
+        data: Data,
+        const Self = @This();
+        const Data = DataStruct(types);
+        const n = types.len;
+        pub const encoder_kind: EncoderKind = .blit;
+
+        pub fn init() Blit(&[_]type{}) {
+            return .{ .data = .{} };
+        }
+
+        pub fn copy(self: Self, src: anytype, dst: anytype, size: u64, opts: struct { src_offset: u64 = 0, dst_offset: u64 = 0 }) Blit(types ++ &[_]type{CopyInfo}) {
+            const src_handle = if (@hasField(@TypeOf(src), "handle")) src.handle else src;
+            const dst_handle = if (@hasField(@TypeOf(dst), "handle")) dst.handle else dst;
+            var result: Blit(types ++ &[_]type{CopyInfo}) = .{ .data = undefined };
+            inline for (0..n) |i| @field(result.data, fieldName(i)) = @field(self.data, fieldName(i));
+            @field(result.data, fieldName(n)) = .{ .src = src_handle, .src_offset = opts.src_offset, .dst = dst_handle, .dst_offset = opts.dst_offset, .size = size };
+            return result;
+        }
+
+        pub fn fill(self: Self, buffer: anytype, value: u8, size: u64, opts: struct { offset: u64 = 0 }) Blit(types ++ &[_]type{FillInfo}) {
+            const handle = if (@hasField(@TypeOf(buffer), "handle")) buffer.handle else buffer;
+            var result: Blit(types ++ &[_]type{FillInfo}) = .{ .data = undefined };
+            inline for (0..n) |i| @field(result.data, fieldName(i)) = @field(self.data, fieldName(i));
+            @field(result.data, fieldName(n)) = .{ .buffer = handle, .offset = opts.offset, .size = size, .value = value };
+            return result;
+        }
+
+        /// Encode blit commands to an encoder
+        pub fn encode(self: *const Self, enc: mtl.MTLBlitCommandEncoderRef) void {
+            inline for (types, 0..) |T, i| {
+                const val = @field(self.data, fieldName(i));
+                if (T == CopyInfo) {
+                    mtl.MTLBlitCommandEncoderCopyFromBuffer(enc, val.src, val.src_offset, val.dst, val.dst_offset, val.size);
+                } else if (T == FillInfo) {
+                    mtl.MTLBlitCommandEncoderFillBuffer(enc, val.buffer, val.offset, val.size, val.value);
+                }
+            }
+        }
+
+        /// Finalize: create command buffer, encode, commit
+        pub fn finalize(self: *const Self, queue: mtl.MTLCommandQueueRef) mtl.MTLCommandBufferRef {
+            const cmd_buf = mtl.MTLCommandQueueCommandBuffer(queue) orelse @panic("Failed to create command buffer");
+            const enc = mtl.MTLCommandBufferBlitCommandEncoder(cmd_buf);
+            self.encode(enc);
+            mtl.MTLBlitCommandEncoderEndEncoding(enc);
+            mtl.MTLCommandBufferCommit(cmd_buf);
+            return cmd_buf;
+        }
+    };
+}
+
+/// Join multiple commands into a single submission
+pub fn join(commands: anytype) JoinedCommand(@TypeOf(commands)) {
+    return .{ .commands = commands };
+}
+
+fn JoinedCommand(comptime T: type) type {
+    return struct {
+        commands: T,
+        const Self = @This();
+
+        pub fn finalize(self: *const Self, queue: mtl.MTLCommandQueueRef) mtl.MTLCommandBufferRef {
+            const cmd_buf = mtl.MTLCommandQueueCommandBuffer(queue) orelse @panic("Failed to create command buffer");
+
+            // Each command gets its own encoder (simple, correct)
+            inline for (std.meta.fields(T)) |field| {
+                const cmd = &@field(self.commands, field.name);
+                const CmdType = @TypeOf(cmd.*);
+
+                if (@hasDecl(CmdType, "encoder_kind")) {
+                    if (CmdType.encoder_kind == .compute) {
+                        const enc = if (@hasDecl(CmdType, "is_concurrent") and CmdType.is_concurrent)
+                            mtl.MTLCommandBufferComputeCommandEncoderWithDispatchType(cmd_buf, mtl.MTLDispatchTypeConcurrent)
+                        else
+                            mtl.MTLCommandBufferComputeCommandEncoder(cmd_buf);
+                        cmd.encode(enc);
+                        mtl.MTLComputeCommandEncoderEndEncoding(enc);
+                    } else if (CmdType.encoder_kind == .blit) {
+                        const enc = mtl.MTLCommandBufferBlitCommandEncoder(cmd_buf);
+                        cmd.encode(enc);
+                        mtl.MTLBlitCommandEncoderEndEncoding(enc);
+                    }
+                }
+            }
+
+            mtl.MTLCommandBufferCommit(cmd_buf);
+            return cmd_buf;
+        }
+    };
+}
+
+/// Entry points
+pub fn compute(pipeline: ComputePipeline) Compute(&[_]type{PipelineBinding}, false) {
+    return Compute(&[_]type{}, false).init(pipeline);
+}
+
+pub fn computeConcurrent(pipeline: ComputePipeline) Compute(&[_]type{PipelineBinding}, true) {
+    return Compute(&[_]type{}, true).init(pipeline);
+}
+
+pub fn blit() Blit(&[_]type{}) {
+    return Blit(&[_]type{}).init();
+}
 
 /// Fence for async submission - call wait() to block until complete
 pub const Fence = struct {
