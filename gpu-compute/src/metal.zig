@@ -140,33 +140,18 @@ pub const Device = struct {
         return queue;
     }
 
-    /// Submit commands to same queue (sequential), wait for completion
-    pub fn submit(self: *Device, commands: []const Command) void {
+    /// Submit a command, wait for completion
+    pub fn submit(self: *Device, command: anytype) void {
         const queue = self.nextQueue();
-
-        var last_cmd_buf: ?mtl.MTLCommandBufferRef = null;
-        for (commands) |cmd| {
-            var c = cmd;
-            last_cmd_buf = c.finalize(queue);
-        }
-
-        // Wait for last command to complete
-        if (last_cmd_buf) |buf| {
-            mtl.MTLCommandBufferWaitUntilCompleted(buf);
-        }
+        const cmd_buf = command.finalize(queue);
+        mtl.MTLCommandBufferWaitUntilCompleted(cmd_buf);
     }
 
-    /// Submit commands to same queue (sequential), return fence
-    pub fn submitAsync(self: *Device, commands: []const Command) Fence {
+    /// Submit a command, return fence for async waiting
+    pub fn submitAsync(self: *Device, command: anytype) Fence {
         const queue = self.nextQueue();
-
-        var last_cmd_buf: ?mtl.MTLCommandBufferRef = null;
-        for (commands) |cmd| {
-            var c = cmd;
-            last_cmd_buf = c.finalize(queue);
-        }
-
-        return Fence{ .command_buffer = last_cmd_buf };
+        const cmd_buf = command.finalize(queue);
+        return Fence{ .command_buffer = cmd_buf };
     }
 };
 
@@ -551,410 +536,440 @@ pub const Texture = struct {
 };
 
 // =============================================================================
-// Builder Pattern Command API
+// Comptime Command Builder API
 // =============================================================================
 
-/// Encoder type currently active
-const EncoderType = enum {
-    none,
-    compute,
-    blit,
-    acceleration_structure,
+/// Operation types for comptime command building
+const Op = enum {
+    switch_to_compute_serial,
+    switch_to_compute_concurrent,
+    switch_to_blit,
+    switch_to_accel,
+    set_pipeline,
+    set_buffer,
+    set_bytes,
+    set_texture,
+    set_accel_struct,
+    dispatch,
+    dispatch_2d,
+    barrier,
+    copy,
+    fill,
+    build_accel,
+    refit_accel,
+    copy_accel,
+    compact_accel,
+    signal_event,
+    wait_event,
 };
 
-/// Max bytes that can be passed via setBytes (Metal limit is 4KB)
-const MAX_BYTES_PER_SET = 256;
-
-/// Recorded encoder operation for deferred execution
-const EncoderOp = union(enum) {
-    set_pipeline: mtl.MTLComputePipelineStateRef,
-    set_buffer: struct { handle: mtl.MTLBufferRef, offset: u64, index: u64 },
-    set_bytes: struct { data: [MAX_BYTES_PER_SET]u8, len: usize, index: u64 },
-    set_texture: struct { handle: mtl.MTLTextureRef, index: u64 },
-    set_acceleration_structure: struct { handle: mtl.MTLAccelerationStructureRef, index: u64 },
-    dispatch: struct { grid: Size, threads: Size },
-    dispatch_indirect: struct { buffer: mtl.MTLBufferRef, offset: u64, threads: Size },
-    memory_barrier: BarrierScope,
-    copy: struct { src: mtl.MTLBufferRef, src_offset: u64, dst: mtl.MTLBufferRef, dst_offset: u64, size: u64 },
-    fill: struct { buffer: mtl.MTLBufferRef, offset: u64, size: u64, value: u8 },
-    switch_to_blit: void,
-    switch_to_compute: bool, // true = concurrent, false = serial
-    switch_to_accel: void,
-    build_accel: struct { accel: mtl.MTLAccelerationStructureRef, descriptor: mtl.MTLAccelerationStructureDescriptorRef, scratch: mtl.MTLBufferRef, scratch_offset: u64 },
-    refit_accel: struct { source: mtl.MTLAccelerationStructureRef, descriptor: mtl.MTLAccelerationStructureDescriptorRef, dest: mtl.MTLAccelerationStructureRef, scratch: mtl.MTLBufferRef, scratch_offset: u64 },
-    copy_accel: struct { source: mtl.MTLAccelerationStructureRef, dest: mtl.MTLAccelerationStructureRef },
-    compact_accel: struct { source: mtl.MTLAccelerationStructureRef, dest: mtl.MTLAccelerationStructureRef },
-    signal_event: struct { event: mtl.MTLEventRef, value: u64 },
-    wait_event: struct { event: mtl.MTLEventRef, value: u64 },
-};
-
-const MAX_OPS = 256;
-
-/// Command buffer builder - fluent API for recording GPU commands
-/// Supports multiple encoder types in a single command buffer
+/// Comptime command builder - generates optimal code at compile time
+/// Each method returns a new type with the operation appended.
 ///
 /// Usage:
-///   device.submit(&.{
-///       Command.init()
-///           .compute(pipeline, .{})              // serial (default)
-///           .setBuffer(buf, 0, .{})
-///           .dispatch1d(pipeline, count)
-///           .compute(pipeline, .{ .concurrent = true })  // concurrent (needs barriers)
-///           .dispatch1d(pipeline, count)
-///           .barrier(.buffers)
-///           .dispatch1d(pipeline, count)
-///   });
-pub const Command = struct {
-    ops: [MAX_OPS]EncoderOp = undefined,
-    op_count: usize = 0,
+///   device.submit(
+///       cmd.compute(pipeline, .{})
+///          .setBuffer(buf_a, 0, .{})
+///          .setBuffer(buf_b, 1, .{})
+///          .dispatch(grid, threads)
+///   );
+pub fn Command(comptime ops: []const Op) type {
+    return struct {
+        // Runtime data stored per-operation
+        data: Data,
 
-    /// Create a new command builder
-    pub fn init() Command {
-        return .{};
-    }
+        const Self = @This();
+        const ops_list = ops;
 
-    fn addOp(self: Command, op: EncoderOp) Command {
-        var cmd = self;
-        if (cmd.op_count < MAX_OPS) {
-            cmd.ops[cmd.op_count] = op;
-            cmd.op_count += 1;
-        }
-        return cmd;
-    }
+        /// Runtime data structure - holds handles/values for each op
+        const Data = GenerateDataStruct(ops);
 
-    /// Start or continue a compute encoder, setting the pipeline
-    /// Options:
-    ///   .concurrent = true  - dispatches can overlap, requires manual barriers
-    ///   .concurrent = false - dispatches execute sequentially (default)
-    pub fn compute(self: Command, pipeline: ComputePipeline, opts: struct { concurrent: bool = false }) Command {
-        return self
-            .addOp(.{ .switch_to_compute = opts.concurrent })
-            .addOp(.{ .set_pipeline = pipeline.handle });
-    }
-
-    /// Set a buffer at the given index (compute encoder)
-    pub fn setBuffer(self: Command, buffer: anytype, index: u64, opts: struct { offset: u64 = 0 }) Command {
-        const handle = if (@hasField(@TypeOf(buffer), "handle")) buffer.handle else buffer;
-        return self.addOp(.{ .set_buffer = .{ .handle = handle, .offset = opts.offset, .index = index } });
-    }
-
-    /// Set a texture at the given index (compute encoder)
-    pub fn setTexture(self: Command, texture: Texture, index: u64) Command {
-        return self.addOp(.{ .set_texture = .{ .handle = texture.handle, .index = index } });
-    }
-
-    /// Set inline bytes at the given index (compute encoder)
-    /// Use for small data like uniforms, constants. Max 4KB, but keep small (<256 bytes).
-    /// Data is copied immediately, so the source doesn't need to persist.
-    pub fn setBytes(self: Command, data: anytype, index: u64) Command {
-        const T = @TypeOf(data);
-        const bytes = if (@typeInfo(T) == .pointer)
-            std.mem.asBytes(data)
-        else
-            std.mem.asBytes(&data);
-
-        if (bytes.len > MAX_BYTES_PER_SET) {
-            @panic("setBytes data exceeds MAX_BYTES_PER_SET limit");
+        pub fn init() Self {
+            return .{ .data = undefined };
         }
 
-        var op_data: [MAX_BYTES_PER_SET]u8 = undefined;
-        @memcpy(op_data[0..bytes.len], bytes);
-
-        return self.addOp(.{ .set_bytes = .{ .data = op_data, .len = bytes.len, .index = index } });
-    }
-
-    /// Dispatch compute threads
-    pub fn dispatch(self: Command, grid: Size, threads_per_group: Size) Command {
-        return self.addOp(.{ .dispatch = .{ .grid = grid, .threads = threads_per_group } });
-    }
-
-    /// Dispatch 1D compute - auto-calculates optimal grid/threads for element count
-    pub fn dispatch1d(self: Command, pipeline: ComputePipeline, element_count: usize) Command {
-        const grid, const threads = pipeline.gridFor1d(element_count);
-        return self.dispatch(grid, threads);
-    }
-
-    /// Dispatch 2D compute for image processing - covers width x height pixels
-    /// Uses 16x16 threadgroups (common for image kernels)
-    pub fn dispatch2d(self: Command, width: u64, height: u64) Command {
-        const threads_per_group = Size{ .width = 16, .height = 16 };
-        const grid = Size{
-            .width = (width + 15) / 16,
-            .height = (height + 15) / 16,
-        };
-        return self.dispatch(grid, threads_per_group);
-    }
-
-    /// Insert a memory barrier (compute encoder)
-    /// For serial dispatch (default): NOT needed - dispatches already execute in order.
-    /// For concurrent dispatch: Required to ensure writes are visible to subsequent reads.
-    /// Also useful for texture memory coherency.
-    pub fn barrier(self: Command, scope: BarrierScope) Command {
-        return self.addOp(.{ .memory_barrier = scope });
-    }
-
-    /// Start a blit encoder
-    pub fn blit(self: Command) Command {
-        return self.addOp(.switch_to_blit);
-    }
-
-    /// Copy buffer to buffer (blit encoder)
-    pub fn copy(self: Command, src: anytype, dst: anytype, size: u64, opts: struct { src_offset: u64 = 0, dst_offset: u64 = 0 }) Command {
-        const src_handle = if (@hasField(@TypeOf(src), "handle")) src.handle else src;
-        const dst_handle = if (@hasField(@TypeOf(dst), "handle")) dst.handle else dst;
-        return self.addOp(.{ .copy = .{ .src = src_handle, .src_offset = opts.src_offset, .dst = dst_handle, .dst_offset = opts.dst_offset, .size = size } });
-    }
-
-    /// Fill buffer with a value (blit encoder)
-    pub fn fill(self: Command, buffer: anytype, value: u8, size: u64, opts: struct { offset: u64 = 0 }) Command {
-        const handle = if (@hasField(@TypeOf(buffer), "handle")) buffer.handle else buffer;
-        return self.addOp(.{ .fill = .{ .buffer = handle, .offset = opts.offset, .size = size, .value = value } });
-    }
-
-    // =========================================================================
-    // Acceleration Structure Commands
-    // =========================================================================
-
-    /// Start an acceleration structure encoder
-    pub fn accel(self: Command) Command {
-        return self.addOp(.switch_to_accel);
-    }
-
-    /// Build an acceleration structure (requires accel encoder)
-    pub fn buildAccelerationStructure(
-        self: Command,
-        acceleration_structure: AccelerationStructure,
-        descriptor: anytype,
-        scratch_buffer: anytype,
-        opts: struct { scratch_offset: u64 = 0 },
-    ) Command {
-        const desc_handle = if (@hasField(@TypeOf(descriptor), "handle")) descriptor.handle else descriptor;
-        const scratch_handle = if (@hasField(@TypeOf(scratch_buffer), "handle")) scratch_buffer.handle else scratch_buffer;
-        return self.addOp(.{ .build_accel = .{
-            .accel = acceleration_structure.handle,
-            .descriptor = desc_handle,
-            .scratch = scratch_handle,
-            .scratch_offset = opts.scratch_offset,
-        } });
-    }
-
-    /// Refit an acceleration structure (for dynamic geometry updates)
-    pub fn refitAccelerationStructure(
-        self: Command,
-        source: AccelerationStructure,
-        descriptor: anytype,
-        dest: AccelerationStructure,
-        scratch_buffer: anytype,
-        opts: struct { scratch_offset: u64 = 0 },
-    ) Command {
-        const desc_handle = if (@hasField(@TypeOf(descriptor), "handle")) descriptor.handle else descriptor;
-        const scratch_handle = if (@hasField(@TypeOf(scratch_buffer), "handle")) scratch_buffer.handle else scratch_buffer;
-        return self.addOp(.{ .refit_accel = .{
-            .source = source.handle,
-            .descriptor = desc_handle,
-            .dest = dest.handle,
-            .scratch = scratch_handle,
-            .scratch_offset = opts.scratch_offset,
-        } });
-    }
-
-    /// Copy an acceleration structure
-    pub fn copyAccelerationStructure(self: Command, source: AccelerationStructure, dest: AccelerationStructure) Command {
-        return self.addOp(.{ .copy_accel = .{ .source = source.handle, .dest = dest.handle } });
-    }
-
-    /// Copy and compact an acceleration structure (reduces memory after build)
-    pub fn compactAccelerationStructure(self: Command, source: AccelerationStructure, dest: AccelerationStructure) Command {
-        return self.addOp(.{ .compact_accel = .{ .source = source.handle, .dest = dest.handle } });
-    }
-
-    /// Set an acceleration structure for use in compute shader (for ray tracing)
-    pub fn setAccelerationStructure(self: Command, accel_struct: AccelerationStructure, index: u64) Command {
-        return self.addOp(.{ .set_acceleration_structure = .{ .handle = accel_struct.handle, .index = index } });
-    }
-
-    // =========================================================================
-    // Synchronization
-    // =========================================================================
-
-    /// Signal an event with a value (encoded at command buffer level)
-    /// Another command buffer can wait on this event+value.
-    pub fn signalEvent(self: Command, event: anytype, value: u64) Command {
-        const handle = if (@hasField(@TypeOf(event), "handle")) event.handle else event;
-        return self.addOp(.{ .signal_event = .{ .event = handle, .value = value } });
-    }
-
-    /// Wait for an event to reach a value before continuing
-    pub fn waitEvent(self: Command, event: anytype, value: u64) Command {
-        const handle = if (@hasField(@TypeOf(event), "handle")) event.handle else event;
-        return self.addOp(.{ .wait_event = .{ .event = handle, .value = value } });
-    }
-
-    /// Finalize and execute the command (called by Device.submit)
-    /// Returns the command buffer for waiting
-    fn finalize(self: *Command, queue: mtl.MTLCommandQueueRef) mtl.MTLCommandBufferRef {
-        const cmd_buf = mtl.MTLCommandQueueCommandBuffer(queue) orelse @panic("Failed to create command buffer");
-
-        var current_encoder: ?*anyopaque = null;
-        var encoder_type: EncoderType = .none;
-
-        // Helper to end current encoder
-        const endEncoder = struct {
-            fn end(enc: ?*anyopaque, enc_type: EncoderType) void {
-                if (enc) |e| {
-                    switch (enc_type) {
-                        .compute => mtl.MTLComputeCommandEncoderEndEncoding(@ptrCast(e)),
-                        .blit => mtl.MTLBlitCommandEncoderEndEncoding(@ptrCast(e)),
-                        .acceleration_structure => mtl.MTLAccelerationStructureCommandEncoderEndEncoding(@ptrCast(e)),
-                        .none => {},
-                    }
+        /// Copy data fields from self to result by iterating over ops (comptime-known)
+        fn copyDataTo(self: *const Self, comptime ResultType: type, result: *ResultType) void {
+            inline for (ops, 0..) |op, i| {
+                switch (op) {
+                    .set_pipeline => @field(result.data, pipelineFieldName(i)) = @field(self.data, pipelineFieldName(i)),
+                    .set_buffer => @field(result.data, bufferFieldName(i)) = @field(self.data, bufferFieldName(i)),
+                    .set_texture => @field(result.data, textureFieldName(i)) = @field(self.data, textureFieldName(i)),
+                    .set_bytes => @field(result.data, bytesFieldName(i)) = @field(self.data, bytesFieldName(i)),
+                    .set_accel_struct => @field(result.data, accelStructFieldName(i)) = @field(self.data, accelStructFieldName(i)),
+                    .dispatch => @field(result.data, dispatchFieldName(i)) = @field(self.data, dispatchFieldName(i)),
+                    .dispatch_2d => @field(result.data, dispatch2dFieldName(i)) = @field(self.data, dispatch2dFieldName(i)),
+                    .barrier => @field(result.data, barrierFieldName(i)) = @field(self.data, barrierFieldName(i)),
+                    .copy => @field(result.data, copyFieldName(i)) = @field(self.data, copyFieldName(i)),
+                    .fill => @field(result.data, fillFieldName(i)) = @field(self.data, fillFieldName(i)),
+                    .build_accel => @field(result.data, buildAccelFieldName(i)) = @field(self.data, buildAccelFieldName(i)),
+                    // Ops without runtime data
+                    .switch_to_compute_serial, .switch_to_compute_concurrent, .switch_to_blit, .switch_to_accel, .refit_accel, .copy_accel, .compact_accel, .signal_event, .wait_event => {},
                 }
             }
-        }.end;
+        }
 
-        for (self.ops[0..self.op_count]) |op| {
-            switch (op) {
-                .switch_to_compute => |concurrent| {
-                    if (encoder_type != .compute) {
-                        endEncoder(current_encoder, encoder_type);
-                        if (concurrent) {
-                            current_encoder = mtl.MTLCommandBufferComputeCommandEncoderWithDispatchType(cmd_buf, mtl.MTLDispatchTypeConcurrent) orelse @panic("Failed to create concurrent compute encoder");
-                        } else {
-                            current_encoder = mtl.MTLCommandBufferComputeCommandEncoder(cmd_buf) orelse @panic("Failed to create compute encoder");
+        // =====================================================================
+        // Compute Operations
+        // =====================================================================
+
+        /// Start a serial compute encoder (dispatches execute sequentially)
+        pub fn compute(self: Self, pipeline: ComputePipeline) Command(ops ++ &[_]Op{ .switch_to_compute_serial, .set_pipeline }) {
+            var result: Command(ops ++ &[_]Op{ .switch_to_compute_serial, .set_pipeline }) = .{ .data = undefined };
+            self.copyDataTo(@TypeOf(result), &result);
+            @field(result.data, pipelineFieldName(ops.len + 1)) = pipeline.handle;
+            return result;
+        }
+
+        /// Start a concurrent compute encoder (dispatches can overlap, needs barriers)
+        pub fn computeConcurrent(self: Self, pipeline: ComputePipeline) Command(ops ++ &[_]Op{ .switch_to_compute_concurrent, .set_pipeline }) {
+            var result: Command(ops ++ &[_]Op{ .switch_to_compute_concurrent, .set_pipeline }) = .{ .data = undefined };
+            self.copyDataTo(@TypeOf(result), &result);
+            @field(result.data, pipelineFieldName(ops.len + 1)) = pipeline.handle;
+            return result;
+        }
+
+        pub fn setBuffer(self: Self, buffer: anytype, index: u64, opts: struct { offset: u64 = 0 }) Command(ops ++ &[_]Op{.set_buffer}) {
+            const handle = if (@hasField(@TypeOf(buffer), "handle")) buffer.handle else buffer;
+            var result: Command(ops ++ &[_]Op{.set_buffer}) = .{ .data = undefined };
+            self.copyDataTo(@TypeOf(result), &result);
+            @field(result.data, bufferFieldName(ops.len)) = .{ .handle = handle, .offset = opts.offset, .index = index };
+            return result;
+        }
+
+        pub fn setTexture(self: Self, texture: Texture, index: u64) Command(ops ++ &[_]Op{.set_texture}) {
+            var result: Command(ops ++ &[_]Op{.set_texture}) = .{ .data = undefined };
+            self.copyDataTo(@TypeOf(result), &result);
+            @field(result.data, textureFieldName(ops.len)) = .{ .handle = texture.handle, .index = index };
+            return result;
+        }
+
+        pub fn setBytes(self: Self, data: anytype, index: u64) Command(ops ++ &[_]Op{.set_bytes}) {
+            var result: Command(ops ++ &[_]Op{.set_bytes}) = .{ .data = undefined };
+            self.copyDataTo(@TypeOf(result), &result);
+            const T = @TypeOf(data);
+            const bytes_ptr = if (@typeInfo(T) == .pointer) data else &data;
+            @field(result.data, bytesFieldName(ops.len)) = .{ .ptr = @ptrCast(bytes_ptr), .len = @sizeOf(std.meta.Child(if (@typeInfo(T) == .pointer) T else *const T)), .index = index };
+            return result;
+        }
+
+        pub fn dispatch(self: Self, grid: Size, threads_per_group: Size) Command(ops ++ &[_]Op{.dispatch}) {
+            var result: Command(ops ++ &[_]Op{.dispatch}) = .{ .data = undefined };
+            self.copyDataTo(@TypeOf(result), &result);
+            @field(result.data, dispatchFieldName(ops.len)) = .{ .grid = grid, .threads = threads_per_group };
+            return result;
+        }
+
+        pub fn dispatch2d(self: Self, width: u64, height: u64) Command(ops ++ &[_]Op{.dispatch_2d}) {
+            var result: Command(ops ++ &[_]Op{.dispatch_2d}) = .{ .data = undefined };
+            self.copyDataTo(@TypeOf(result), &result);
+            @field(result.data, dispatch2dFieldName(ops.len)) = .{ .width = width, .height = height };
+            return result;
+        }
+
+        pub fn dispatch1d(self: Self, pipeline: ComputePipeline, element_count: usize) Command(ops ++ &[_]Op{.dispatch}) {
+            const grid, const threads = pipeline.gridFor1d(element_count);
+            return self.dispatch(grid, threads);
+        }
+
+        pub fn barrier(self: Self, scope: BarrierScope) Command(ops ++ &[_]Op{.barrier}) {
+            var result: Command(ops ++ &[_]Op{.barrier}) = .{ .data = undefined };
+            self.copyDataTo(@TypeOf(result), &result);
+            @field(result.data, barrierFieldName(ops.len)) = scope;
+            return result;
+        }
+
+        // =====================================================================
+        // Blit Operations
+        // =====================================================================
+
+        pub fn blit(self: Self) Command(ops ++ &[_]Op{.switch_to_blit}) {
+            var result: Command(ops ++ &[_]Op{.switch_to_blit}) = .{ .data = undefined };
+            self.copyDataTo(@TypeOf(result), &result);
+            return result;
+        }
+
+        pub fn copy(self: Self, src: anytype, dst: anytype, size: u64, opts: struct { src_offset: u64 = 0, dst_offset: u64 = 0 }) Command(ops ++ &[_]Op{.copy}) {
+            const src_handle = if (@hasField(@TypeOf(src), "handle")) src.handle else src;
+            const dst_handle = if (@hasField(@TypeOf(dst), "handle")) dst.handle else dst;
+            var result: Command(ops ++ &[_]Op{.copy}) = .{ .data = undefined };
+            self.copyDataTo(@TypeOf(result), &result);
+            @field(result.data, copyFieldName(ops.len)) = .{ .src = src_handle, .src_offset = opts.src_offset, .dst = dst_handle, .dst_offset = opts.dst_offset, .size = size };
+            return result;
+        }
+
+        pub fn fill(self: Self, buffer: anytype, value: u8, size: u64, opts: struct { offset: u64 = 0 }) Command(ops ++ &[_]Op{.fill}) {
+            const handle = if (@hasField(@TypeOf(buffer), "handle")) buffer.handle else buffer;
+            var result: Command(ops ++ &[_]Op{.fill}) = .{ .data = undefined };
+            self.copyDataTo(@TypeOf(result), &result);
+            @field(result.data, fillFieldName(ops.len)) = .{ .buffer = handle, .offset = opts.offset, .size = size, .value = value };
+            return result;
+        }
+
+        // =====================================================================
+        // Acceleration Structure Operations
+        // =====================================================================
+
+        pub fn accel(self: Self) Command(ops ++ &[_]Op{.switch_to_accel}) {
+            var result: Command(ops ++ &[_]Op{.switch_to_accel}) = .{ .data = undefined };
+            self.copyDataTo(@TypeOf(result), &result);
+            return result;
+        }
+
+        pub fn buildAccelerationStructure(
+            self: Self,
+            acceleration_structure: AccelerationStructure,
+            descriptor: anytype,
+            scratch_buffer: anytype,
+            opts: struct { scratch_offset: u64 = 0 },
+        ) Command(ops ++ &[_]Op{.build_accel}) {
+            const desc_handle = if (@hasField(@TypeOf(descriptor), "handle")) descriptor.handle else descriptor;
+            const scratch_handle = if (@hasField(@TypeOf(scratch_buffer), "handle")) scratch_buffer.handle else scratch_buffer;
+            var result: Command(ops ++ &[_]Op{.build_accel}) = .{ .data = undefined };
+            self.copyDataTo(@TypeOf(result), &result);
+            @field(result.data, buildAccelFieldName(ops.len)) = .{
+                .accel = acceleration_structure.handle,
+                .descriptor = desc_handle,
+                .scratch = scratch_handle,
+                .scratch_offset = opts.scratch_offset,
+            };
+            return result;
+        }
+
+        pub fn setAccelerationStructure(self: Self, accel_struct: AccelerationStructure, index: u64) Command(ops ++ &[_]Op{.set_accel_struct}) {
+            var result: Command(ops ++ &[_]Op{.set_accel_struct}) = .{ .data = undefined };
+            self.copyDataTo(@TypeOf(result), &result);
+            @field(result.data, accelStructFieldName(ops.len)) = .{ .handle = accel_struct.handle, .index = index };
+            return result;
+        }
+
+        // =====================================================================
+        // Finalize - generates inline Metal calls
+        // =====================================================================
+
+        pub inline fn finalize(self: *const Self, queue: mtl.MTLCommandQueueRef) mtl.MTLCommandBufferRef {
+            const cmd_buf = mtl.MTLCommandQueueCommandBuffer(queue) orelse @panic("Failed to create command buffer");
+
+            var compute_enc: ?mtl.MTLComputeCommandEncoderRef = null;
+            var blit_enc: ?mtl.MTLBlitCommandEncoderRef = null;
+            var accel_enc: ?mtl.MTLAccelerationStructureCommandEncoderRef = null;
+
+            inline for (ops, 0..) |op, i| {
+                switch (op) {
+                    .switch_to_compute_serial => {
+                        if (blit_enc) |e| {
+                            mtl.MTLBlitCommandEncoderEndEncoding(e);
+                            blit_enc = null;
                         }
-                        encoder_type = .compute;
-                    }
-                },
-                .switch_to_blit => {
-                    if (encoder_type != .blit) {
-                        endEncoder(current_encoder, encoder_type);
-                        current_encoder = mtl.MTLCommandBufferBlitCommandEncoder(cmd_buf) orelse @panic("Failed to create blit encoder");
-                        encoder_type = .blit;
-                    }
-                },
-                .switch_to_accel => {
-                    if (encoder_type != .acceleration_structure) {
-                        endEncoder(current_encoder, encoder_type);
-                        current_encoder = mtl.MTLCommandBufferAccelerationStructureCommandEncoder(cmd_buf) orelse @panic("Failed to create acceleration structure encoder");
-                        encoder_type = .acceleration_structure;
-                    }
-                },
-                .set_pipeline => |pipeline_handle| {
-                    if (encoder_type == .compute) {
-                        mtl.MTLComputeCommandEncoderSetComputePipelineState(@ptrCast(current_encoder.?), pipeline_handle);
-                    }
-                },
-                .set_buffer => |b| {
-                    if (encoder_type == .compute) {
-                        mtl.MTLComputeCommandEncoderSetBuffer(@ptrCast(current_encoder.?), b.handle, b.offset, b.index);
-                    }
-                },
-                .set_bytes => |b| {
-                    if (encoder_type == .compute) {
-                        mtl.MTLComputeCommandEncoderSetBytes(@ptrCast(current_encoder.?), &b.data, b.len, b.index);
-                    }
-                },
-                .set_texture => |t| {
-                    if (encoder_type == .compute) {
-                        mtl.MTLComputeCommandEncoderSetTexture(@ptrCast(current_encoder.?), t.handle, t.index);
-                    }
-                },
-                .set_acceleration_structure => |a| {
-                    if (encoder_type == .compute) {
-                        mtl.MTLComputeCommandEncoderSetAccelerationStructure(@ptrCast(current_encoder.?), a.handle, a.index);
-                    }
-                },
-                .dispatch => |d| {
-                    if (encoder_type == .compute) {
+                        if (accel_enc) |e| {
+                            mtl.MTLAccelerationStructureCommandEncoderEndEncoding(e);
+                            accel_enc = null;
+                        }
+                        if (compute_enc == null) {
+                            compute_enc = mtl.MTLCommandBufferComputeCommandEncoder(cmd_buf);
+                        }
+                    },
+                    .switch_to_compute_concurrent => {
+                        if (blit_enc) |e| {
+                            mtl.MTLBlitCommandEncoderEndEncoding(e);
+                            blit_enc = null;
+                        }
+                        if (accel_enc) |e| {
+                            mtl.MTLAccelerationStructureCommandEncoderEndEncoding(e);
+                            accel_enc = null;
+                        }
+                        if (compute_enc == null) {
+                            compute_enc = mtl.MTLCommandBufferComputeCommandEncoderWithDispatchType(cmd_buf, mtl.MTLDispatchTypeConcurrent);
+                        }
+                    },
+                    .switch_to_blit => {
+                        if (compute_enc) |e| {
+                            mtl.MTLComputeCommandEncoderEndEncoding(e);
+                            compute_enc = null;
+                        }
+                        if (accel_enc) |e| {
+                            mtl.MTLAccelerationStructureCommandEncoderEndEncoding(e);
+                            accel_enc = null;
+                        }
+                        if (blit_enc == null) {
+                            blit_enc = mtl.MTLCommandBufferBlitCommandEncoder(cmd_buf);
+                        }
+                    },
+                    .switch_to_accel => {
+                        if (compute_enc) |e| {
+                            mtl.MTLComputeCommandEncoderEndEncoding(e);
+                            compute_enc = null;
+                        }
+                        if (blit_enc) |e| {
+                            mtl.MTLBlitCommandEncoderEndEncoding(e);
+                            blit_enc = null;
+                        }
+                        if (accel_enc == null) {
+                            accel_enc = mtl.MTLCommandBufferAccelerationStructureCommandEncoder(cmd_buf);
+                        }
+                    },
+                    .set_pipeline => {
+                        const handle = @field(self.data, pipelineFieldName(i));
+                        mtl.MTLComputeCommandEncoderSetComputePipelineState(compute_enc.?, handle);
+                    },
+                    .set_buffer => {
+                        const d = @field(self.data, bufferFieldName(i));
+                        mtl.MTLComputeCommandEncoderSetBuffer(compute_enc.?, d.handle, d.offset, d.index);
+                    },
+                    .set_texture => {
+                        const d = @field(self.data, textureFieldName(i));
+                        mtl.MTLComputeCommandEncoderSetTexture(compute_enc.?, d.handle, d.index);
+                    },
+                    .set_bytes => {
+                        const d = @field(self.data, bytesFieldName(i));
+                        mtl.MTLComputeCommandEncoderSetBytes(compute_enc.?, d.ptr, d.len, d.index);
+                    },
+                    .set_accel_struct => {
+                        const d = @field(self.data, accelStructFieldName(i));
+                        mtl.MTLComputeCommandEncoderSetAccelerationStructure(compute_enc.?, d.handle, d.index);
+                    },
+                    .dispatch => {
+                        const d = @field(self.data, dispatchFieldName(i));
                         mtl.MTLComputeCommandEncoderDispatchThreadgroups(
-                            @ptrCast(current_encoder.?),
+                            compute_enc.?,
                             mtl.MTLSize{ .width = d.grid.width, .height = d.grid.height, .depth = d.grid.depth },
                             mtl.MTLSize{ .width = d.threads.width, .height = d.threads.height, .depth = d.threads.depth },
                         );
-                    }
-                },
-                .copy => |c| {
-                    if (encoder_type == .blit) {
-                        mtl.MTLBlitCommandEncoderCopyFromBuffer(@ptrCast(current_encoder.?), c.src, c.src_offset, c.dst, c.dst_offset, c.size);
-                    }
-                },
-                .fill => |f| {
-                    if (encoder_type == .blit) {
-                        mtl.MTLBlitCommandEncoderFillBuffer(@ptrCast(current_encoder.?), f.buffer, f.offset, f.size, f.value);
-                    }
-                },
-                .build_accel => |b| {
-                    if (encoder_type == .acceleration_structure) {
-                        mtl.MTLAccelerationStructureCommandEncoderBuildAccelerationStructure(
-                            @ptrCast(current_encoder.?),
-                            b.accel,
-                            b.descriptor,
-                            b.scratch,
-                            b.scratch_offset,
+                    },
+                    .dispatch_2d => {
+                        const d = @field(self.data, dispatch2dFieldName(i));
+                        const grid_w = (d.width + 15) / 16;
+                        const grid_h = (d.height + 15) / 16;
+                        mtl.MTLComputeCommandEncoderDispatchThreadgroups(
+                            compute_enc.?,
+                            mtl.MTLSize{ .width = grid_w, .height = grid_h, .depth = 1 },
+                            mtl.MTLSize{ .width = 16, .height = 16, .depth = 1 },
                         );
-                    }
-                },
-                .refit_accel => |r| {
-                    if (encoder_type == .acceleration_structure) {
-                        mtl.MTLAccelerationStructureCommandEncoderRefitAccelerationStructure(
-                            @ptrCast(current_encoder.?),
-                            r.source,
-                            r.descriptor,
-                            r.dest,
-                            r.scratch,
-                            r.scratch_offset,
-                        );
-                    }
-                },
-                .copy_accel => |c| {
-                    if (encoder_type == .acceleration_structure) {
-                        mtl.MTLAccelerationStructureCommandEncoderCopyAccelerationStructure(
-                            @ptrCast(current_encoder.?),
-                            c.source,
-                            c.dest,
-                        );
-                    }
-                },
-                .compact_accel => |c| {
-                    if (encoder_type == .acceleration_structure) {
-                        mtl.MTLAccelerationStructureCommandEncoderCopyAndCompactAccelerationStructure(
-                            @ptrCast(current_encoder.?),
-                            c.source,
-                            c.dest,
-                        );
-                    }
-                },
-                .memory_barrier => |scope| {
-                    if (encoder_type == .compute) {
-                        mtl.MTLComputeCommandEncoderMemoryBarrierWithScope(@ptrCast(current_encoder.?), @intFromEnum(scope));
-                    }
-                },
-                .signal_event => |e| {
-                    // Events are encoded on command buffer, need to end current encoder first
-                    endEncoder(current_encoder, encoder_type);
-                    current_encoder = null;
-                    encoder_type = .none;
-                    mtl.MTLCommandBufferEncodeSignalEvent(cmd_buf, e.event, e.value);
-                },
-                .wait_event => |e| {
-                    // Events are encoded on command buffer, need to end current encoder first
-                    endEncoder(current_encoder, encoder_type);
-                    current_encoder = null;
-                    encoder_type = .none;
-                    mtl.MTLCommandBufferEncodeWaitForEvent(cmd_buf, e.event, e.value);
-                },
-                // Not yet implemented
-                .dispatch_indirect => {},
+                    },
+                    .barrier => {
+                        const scope = @field(self.data, barrierFieldName(i));
+                        mtl.MTLComputeCommandEncoderMemoryBarrierWithScope(compute_enc.?, @intFromEnum(scope));
+                    },
+                    .copy => {
+                        const d = @field(self.data, copyFieldName(i));
+                        mtl.MTLBlitCommandEncoderCopyFromBuffer(blit_enc.?, d.src, d.src_offset, d.dst, d.dst_offset, d.size);
+                    },
+                    .fill => {
+                        const d = @field(self.data, fillFieldName(i));
+                        mtl.MTLBlitCommandEncoderFillBuffer(blit_enc.?, d.buffer, d.offset, d.size, d.value);
+                    },
+                    .build_accel => {
+                        const d = @field(self.data, buildAccelFieldName(i));
+                        mtl.MTLAccelerationStructureCommandEncoderBuildAccelerationStructure(accel_enc.?, d.accel, d.descriptor, d.scratch, d.scratch_offset);
+                    },
+                    .refit_accel, .copy_accel, .compact_accel, .signal_event, .wait_event => {
+                        // TODO: implement these as needed
+                    },
+                }
             }
+
+            // End active encoders
+            if (compute_enc) |e| mtl.MTLComputeCommandEncoderEndEncoding(e);
+            if (blit_enc) |e| mtl.MTLBlitCommandEncoderEndEncoding(e);
+            if (accel_enc) |e| mtl.MTLAccelerationStructureCommandEncoderEndEncoding(e);
+
+            mtl.MTLCommandBufferCommit(cmd_buf);
+            return cmd_buf;
         }
+    };
+}
 
-        // End final encoder
-        endEncoder(current_encoder, encoder_type);
+// Field name generators for unique field names per operation index
+fn pipelineFieldName(comptime i: usize) [:0]const u8 {
+    return std.fmt.comptimePrint("pipeline_{d}", .{i});
+}
+fn bufferFieldName(comptime i: usize) [:0]const u8 {
+    return std.fmt.comptimePrint("buffer_{d}", .{i});
+}
+fn textureFieldName(comptime i: usize) [:0]const u8 {
+    return std.fmt.comptimePrint("texture_{d}", .{i});
+}
+fn bytesFieldName(comptime i: usize) [:0]const u8 {
+    return std.fmt.comptimePrint("bytes_{d}", .{i});
+}
+fn dispatchFieldName(comptime i: usize) [:0]const u8 {
+    return std.fmt.comptimePrint("dispatch_{d}", .{i});
+}
+fn dispatch2dFieldName(comptime i: usize) [:0]const u8 {
+    return std.fmt.comptimePrint("dispatch2d_{d}", .{i});
+}
+fn barrierFieldName(comptime i: usize) [:0]const u8 {
+    return std.fmt.comptimePrint("barrier_{d}", .{i});
+}
+fn copyFieldName(comptime i: usize) [:0]const u8 {
+    return std.fmt.comptimePrint("copy_{d}", .{i});
+}
+fn fillFieldName(comptime i: usize) [:0]const u8 {
+    return std.fmt.comptimePrint("fill_{d}", .{i});
+}
+fn buildAccelFieldName(comptime i: usize) [:0]const u8 {
+    return std.fmt.comptimePrint("build_accel_{d}", .{i});
+}
+fn accelStructFieldName(comptime i: usize) [:0]const u8 {
+    return std.fmt.comptimePrint("accel_struct_{d}", .{i});
+}
 
-        mtl.MTLCommandBufferCommit(cmd_buf);
-        return cmd_buf;
+// Data types for each operation
+const BufferData = struct { handle: mtl.MTLBufferRef, offset: u64, index: u64 };
+const TextureData = struct { handle: mtl.MTLTextureRef, index: u64 };
+const BytesData = struct { ptr: *const anyopaque, len: usize, index: u64 };
+const AccelStructData = struct { handle: mtl.MTLAccelerationStructureRef, index: u64 };
+const DispatchData = struct { grid: Size, threads: Size };
+const Dispatch2dData = struct { width: u64, height: u64 };
+const CopyData = struct { src: mtl.MTLBufferRef, src_offset: u64, dst: mtl.MTLBufferRef, dst_offset: u64, size: u64 };
+const FillData = struct { buffer: mtl.MTLBufferRef, offset: u64, size: u64, value: u8 };
+const BuildAccelData = struct { accel: mtl.MTLAccelerationStructureRef, descriptor: mtl.MTLAccelerationStructureDescriptorRef, scratch: mtl.MTLBufferRef, scratch_offset: u64 };
+
+fn makeField(comptime name: [:0]const u8, comptime T: type) std.builtin.Type.StructField {
+    return .{
+        .name = name,
+        .type = T,
+        .default_value_ptr = null,
+        .is_comptime = false,
+        .alignment = @alignOf(T),
+    };
+}
+
+/// Generate a struct type holding runtime data for the given ops
+fn GenerateDataStruct(comptime ops: []const Op) type {
+    var fields: []const std.builtin.Type.StructField = &.{};
+
+    for (ops, 0..) |op, i| {
+        const maybe_field: ?std.builtin.Type.StructField = switch (op) {
+            .set_pipeline => makeField(pipelineFieldName(i), mtl.MTLComputePipelineStateRef),
+            .set_buffer => makeField(bufferFieldName(i), BufferData),
+            .set_texture => makeField(textureFieldName(i), TextureData),
+            .set_bytes => makeField(bytesFieldName(i), BytesData),
+            .set_accel_struct => makeField(accelStructFieldName(i), AccelStructData),
+            .dispatch => makeField(dispatchFieldName(i), DispatchData),
+            .dispatch_2d => makeField(dispatch2dFieldName(i), Dispatch2dData),
+            .barrier => makeField(barrierFieldName(i), BarrierScope),
+            .copy => makeField(copyFieldName(i), CopyData),
+            .fill => makeField(fillFieldName(i), FillData),
+            .build_accel => makeField(buildAccelFieldName(i), BuildAccelData),
+            // Ops that don't need runtime data
+            .switch_to_compute_serial, .switch_to_compute_concurrent, .switch_to_blit, .switch_to_accel, .refit_accel, .copy_accel, .compact_accel, .signal_event, .wait_event => null,
+        };
+        if (maybe_field) |field| {
+            fields = fields ++ &[_]std.builtin.Type.StructField{field};
+        }
     }
-};
+
+    return @Type(.{ .@"struct" = .{
+        .layout = .auto,
+        .fields = fields,
+        .decls = &.{},
+        .is_tuple = false,
+    } });
+}
+
+/// Entry point - start building a command
+pub const cmd = Command(&.{}).init();
 
 /// Fence for async submission - call wait() to block until complete
 pub const Fence = struct {
