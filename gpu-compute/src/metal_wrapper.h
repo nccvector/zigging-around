@@ -69,6 +69,11 @@ typedef void* MTLStencilDescriptorRef;
 typedef void* MTLVertexDescriptorRef;
 typedef void* MTLIndirectCommandBufferDescriptorRef;
 typedef void* MTLAccelerationStructureDescriptorRef;
+typedef void* MTLPrimitiveAccelerationStructureDescriptorRef;
+typedef void* MTLInstanceAccelerationStructureDescriptorRef;
+typedef void* MTLAccelerationStructureGeometryDescriptorRef;
+typedef void* MTLAccelerationStructureTriangleGeometryDescriptorRef;
+typedef void* MTLAccelerationStructureBoundingBoxGeometryDescriptorRef;
 
 // =============================================================================
 // Structs
@@ -965,6 +970,65 @@ void MTLVertexDescriptorSetAttributeBufferIndex(MTLVertexDescriptorRef desc, uin
 void MTLVertexDescriptorSetLayoutStride(MTLVertexDescriptorRef desc, uint64_t index, uint64_t stride);
 void MTLVertexDescriptorSetLayoutStepFunction(MTLVertexDescriptorRef desc, uint64_t index, MTLVertexStepFunction stepFunc);
 void MTLVertexDescriptorSetLayoutStepRate(MTLVertexDescriptorRef desc, uint64_t index, uint64_t stepRate);
+
+// =============================================================================
+// Acceleration Structures
+// =============================================================================
+
+// Acceleration Structure Sizes (returned struct)
+typedef struct {
+    uint64_t accelerationStructureSize;
+    uint64_t buildScratchBufferSize;
+    uint64_t refitScratchBufferSize;
+} MTLAccelerationStructureSizes;
+
+// Device - Acceleration Structure Creation
+MTLAccelerationStructureSizes MTLDeviceGetAccelerationStructureSizes(MTLDeviceRef device, MTLAccelerationStructureDescriptorRef descriptor);
+MTLAccelerationStructureRef MTLDeviceNewAccelerationStructureWithSize(MTLDeviceRef device, uint64_t size);
+MTLAccelerationStructureRef MTLDeviceNewAccelerationStructureWithDescriptor(MTLDeviceRef device, MTLAccelerationStructureDescriptorRef descriptor);
+
+// MTLAccelerationStructure
+uint64_t MTLAccelerationStructureSize(MTLAccelerationStructureRef accel);
+
+// Primitive Acceleration Structure Descriptor (for BLAS)
+MTLPrimitiveAccelerationStructureDescriptorRef MTLPrimitiveAccelerationStructureDescriptorCreate(void);
+void MTLPrimitiveAccelerationStructureDescriptorSetGeometryDescriptors(MTLPrimitiveAccelerationStructureDescriptorRef desc, void** geometryDescriptors, uint64_t count);
+
+// Triangle Geometry Descriptor
+MTLAccelerationStructureTriangleGeometryDescriptorRef MTLAccelerationStructureTriangleGeometryDescriptorCreate(void);
+void MTLAccelerationStructureTriangleGeometryDescriptorSetVertexBuffer(MTLAccelerationStructureTriangleGeometryDescriptorRef desc, MTLBufferRef buffer);
+void MTLAccelerationStructureTriangleGeometryDescriptorSetVertexBufferOffset(MTLAccelerationStructureTriangleGeometryDescriptorRef desc, uint64_t offset);
+void MTLAccelerationStructureTriangleGeometryDescriptorSetVertexStride(MTLAccelerationStructureTriangleGeometryDescriptorRef desc, uint64_t stride);
+void MTLAccelerationStructureTriangleGeometryDescriptorSetIndexBuffer(MTLAccelerationStructureTriangleGeometryDescriptorRef desc, MTLBufferRef buffer);
+void MTLAccelerationStructureTriangleGeometryDescriptorSetIndexBufferOffset(MTLAccelerationStructureTriangleGeometryDescriptorRef desc, uint64_t offset);
+void MTLAccelerationStructureTriangleGeometryDescriptorSetIndexType(MTLAccelerationStructureTriangleGeometryDescriptorRef desc, MTLIndexType type);
+void MTLAccelerationStructureTriangleGeometryDescriptorSetTriangleCount(MTLAccelerationStructureTriangleGeometryDescriptorRef desc, uint64_t count);
+
+// Bounding Box Geometry Descriptor (for custom primitives like spheres)
+MTLAccelerationStructureBoundingBoxGeometryDescriptorRef MTLAccelerationStructureBoundingBoxGeometryDescriptorCreate(void);
+void MTLAccelerationStructureBoundingBoxGeometryDescriptorSetBoundingBoxBuffer(MTLAccelerationStructureBoundingBoxGeometryDescriptorRef desc, MTLBufferRef buffer);
+void MTLAccelerationStructureBoundingBoxGeometryDescriptorSetBoundingBoxBufferOffset(MTLAccelerationStructureBoundingBoxGeometryDescriptorRef desc, uint64_t offset);
+void MTLAccelerationStructureBoundingBoxGeometryDescriptorSetBoundingBoxStride(MTLAccelerationStructureBoundingBoxGeometryDescriptorRef desc, uint64_t stride);
+void MTLAccelerationStructureBoundingBoxGeometryDescriptorSetBoundingBoxCount(MTLAccelerationStructureBoundingBoxGeometryDescriptorRef desc, uint64_t count);
+
+// Instance Acceleration Structure Descriptor (for TLAS)
+MTLInstanceAccelerationStructureDescriptorRef MTLInstanceAccelerationStructureDescriptorCreate(void);
+void MTLInstanceAccelerationStructureDescriptorSetInstanceDescriptorBuffer(MTLInstanceAccelerationStructureDescriptorRef desc, MTLBufferRef buffer);
+void MTLInstanceAccelerationStructureDescriptorSetInstanceDescriptorBufferOffset(MTLInstanceAccelerationStructureDescriptorRef desc, uint64_t offset);
+void MTLInstanceAccelerationStructureDescriptorSetInstanceDescriptorStride(MTLInstanceAccelerationStructureDescriptorRef desc, uint64_t stride);
+void MTLInstanceAccelerationStructureDescriptorSetInstanceCount(MTLInstanceAccelerationStructureDescriptorRef desc, uint64_t count);
+void MTLInstanceAccelerationStructureDescriptorSetInstancedAccelerationStructures(MTLInstanceAccelerationStructureDescriptorRef desc, MTLAccelerationStructureRef* structures, uint64_t count);
+
+// Acceleration Structure Command Encoder
+void MTLAccelerationStructureCommandEncoderBuildAccelerationStructure(MTLAccelerationStructureCommandEncoderRef encoder, MTLAccelerationStructureRef accel, MTLAccelerationStructureDescriptorRef descriptor, MTLBufferRef scratchBuffer, uint64_t scratchBufferOffset);
+void MTLAccelerationStructureCommandEncoderRefitAccelerationStructure(MTLAccelerationStructureCommandEncoderRef encoder, MTLAccelerationStructureRef sourceAccel, MTLAccelerationStructureDescriptorRef descriptor, MTLAccelerationStructureRef destAccel, MTLBufferRef scratchBuffer, uint64_t scratchBufferOffset);
+void MTLAccelerationStructureCommandEncoderCopyAccelerationStructure(MTLAccelerationStructureCommandEncoderRef encoder, MTLAccelerationStructureRef sourceAccel, MTLAccelerationStructureRef destAccel);
+void MTLAccelerationStructureCommandEncoderWriteCompactedAccelerationStructureSize(MTLAccelerationStructureCommandEncoderRef encoder, MTLAccelerationStructureRef accel, MTLBufferRef buffer, uint64_t offset);
+void MTLAccelerationStructureCommandEncoderCopyAndCompactAccelerationStructure(MTLAccelerationStructureCommandEncoderRef encoder, MTLAccelerationStructureRef sourceAccel, MTLAccelerationStructureRef destAccel);
+void MTLAccelerationStructureCommandEncoderEndEncoding(MTLAccelerationStructureCommandEncoderRef encoder);
+
+// Compute Encoder - Acceleration Structure
+void MTLComputeCommandEncoderSetAccelerationStructure(MTLComputeCommandEncoderRef encoder, MTLAccelerationStructureRef accel, uint64_t index);
 
 #ifdef __cplusplus
 }

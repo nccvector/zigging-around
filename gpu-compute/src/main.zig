@@ -353,23 +353,503 @@ test "lesson_01_hello_compute" {
 
     const array_len: usize = 16_000_000;
 
-    const device = try zmtl.Device.default();
-    const library = try device.createLibrary(shader_source);
-    const pipeline = try library.createComputePipeline("hello");
+    // Setup
+    var device = try zmtl.Device.default();
+    const pipeline = try device.createComputePipeline(shader_source, "hello");
     const buffer = try device.createBuffer(f32, array_len);
-    const queue = try device.createCommandQueue();
 
-    const threads_per_group = pipeline.maxThreadsPerThreadGroup();
-    const num_groups = (array_len + threads_per_group - 1) / threads_per_group;
-
-    var command = try pipeline.begin(queue);
-    command.setBuffer(f32, buffer, 0, 0);
-    command.dispatch(zmtl.Size.init1d(num_groups), zmtl.Size.init1d(threads_per_group));
-    command.submit();
+    // Submit command - device manages queue internally
+    device.submit(&.{
+        zmtl.Command.init()
+            .compute(pipeline, .{})
+            .setBuffer(buffer, 0, .{})
+            .dispatch1d(pipeline, array_len),
+    });
 
     // Verify
-    const output = buffer.contents();
+    const output = buffer.contents().?;
     for (output) |val| {
         try std.testing.expectEqual(@as(f32, 42.0), val);
     }
+}
+
+test "lesson_01_async" {
+    const shader_source: [*:0]const u8 =
+        \\#include <metal_stdlib>
+        \\using namespace metal;
+        \\
+        \\kernel void hello(
+        \\    device float* output [[buffer(0)]],
+        \\    uint id [[thread_position_in_grid]]
+        \\) {
+        \\    output[id] = 42.0;
+        \\}
+    ;
+
+    const array_len: usize = 16_000_000;
+
+    var device = try zmtl.Device.default();
+    const pipeline = try device.createComputePipeline(shader_source, "hello");
+    const buffer = try device.createBuffer(f32, array_len);
+
+    // Async submission
+    const fence = device.submitAsync(&.{
+        zmtl.Command.init()
+            .compute(pipeline, .{})
+            .setBuffer(buffer, 0, .{})
+            .dispatch1d(pipeline, array_len),
+    });
+
+    // Could do other work here...
+
+    // Wait for completion
+    fence.wait();
+
+    // Verify
+    const output = buffer.contents().?;
+    for (output) |val| {
+        try std.testing.expectEqual(@as(f32, 42.0), val);
+    }
+}
+
+test "lesson_02_pipeline_switch" {
+    // Two kernels: one doubles, one adds 10
+    const shader_source: [*:0]const u8 =
+        \\#include <metal_stdlib>
+        \\using namespace metal;
+        \\
+        \\kernel void double_it(
+        \\    device float* data [[buffer(0)]],
+        \\    uint id [[thread_position_in_grid]]
+        \\) {
+        \\    data[id] = data[id] * 2.0;
+        \\}
+        \\
+        \\kernel void add_ten(
+        \\    device float* data [[buffer(0)]],
+        \\    uint id [[thread_position_in_grid]]
+        \\) {
+        \\    data[id] = data[id] + 10.0;
+        \\}
+    ;
+
+    const array_len: usize = 1024;
+
+    var device = try zmtl.Device.default();
+    const double_pipeline = try device.createComputePipeline(shader_source, "double_it");
+    const add_pipeline = try device.createComputePipeline(shader_source, "add_ten");
+    const buffer = try device.createBuffer(f32, array_len);
+
+    // Initialize buffer with 1.0
+    const data = buffer.contents().?;
+    for (data) |*val| {
+        val.* = 1.0;
+    }
+
+    // Single command, switching pipelines
+    // 1.0 -> double -> 2.0 -> add_ten -> 12.0
+    device.submit(&.{
+        zmtl.Command.init()
+            .compute(double_pipeline, .{})
+            .setBuffer(buffer, 0, .{})
+            .dispatch1d(double_pipeline, array_len)
+            .compute(add_pipeline, .{}) // switch pipeline, same encoder!
+            .setBuffer(buffer, 0, .{})
+            .dispatch1d(add_pipeline, array_len),
+    });
+
+    // Verify: should be 12.0
+    const output = buffer.contents().?;
+    for (output) |val| {
+        try std.testing.expectEqual(@as(f32, 12.0), val);
+    }
+}
+
+test "lesson_03_compute_and_blit" {
+    const shader_source: [*:0]const u8 =
+        \\#include <metal_stdlib>
+        \\using namespace metal;
+        \\
+        \\kernel void fill_42(
+        \\    device float* data [[buffer(0)]],
+        \\    uint id [[thread_position_in_grid]]
+        \\) {
+        \\    data[id] = 42.0;
+        \\}
+    ;
+
+    const array_len: usize = 1024;
+
+    var device = try zmtl.Device.default();
+    const pipeline = try device.createComputePipeline(shader_source, "fill_42");
+    const src_buffer = try device.createBuffer(f32, array_len);
+    const dst_buffer = try device.createBuffer(f32, array_len);
+
+    // Compute fills src, then blit copies to dst
+    device.submit(&.{
+        zmtl.Command.init()
+            .compute(pipeline, .{})
+            .setBuffer(src_buffer, 0, .{})
+            .dispatch1d(pipeline, array_len)
+            .blit() // switch to blit encoder
+            .copy(src_buffer, dst_buffer, src_buffer.byteSize(), .{}),
+    });
+
+    // Verify dst has 42.0
+    const output = dst_buffer.contents().?;
+    for (output) |val| {
+        try std.testing.expectEqual(@as(f32, 42.0), val);
+    }
+}
+
+test "lesson_04_setBytes" {
+    // Test setBytes for inline uniform data
+    const scale_shader: [*:0]const u8 =
+        \\#include <metal_stdlib>
+        \\using namespace metal;
+        \\
+        \\struct Params {
+        \\    float scale;
+        \\    uint offset;
+        \\};
+        \\
+        \\kernel void scale_kernel(
+        \\    device float* data [[buffer(0)]],
+        \\    constant Params& params [[buffer(1)]],
+        \\    uint tid [[thread_position_in_grid]]
+        \\) {
+        \\    data[tid + params.offset] *= params.scale;
+        \\}
+    ;
+
+    const Params = extern struct {
+        scale: f32,
+        offset: u32,
+    };
+
+    var device = try zmtl.Device.default();
+    const pipeline = try device.createComputePipeline(scale_shader, "scale_kernel");
+    var buffer = try device.createBuffer(f32, 8);
+
+    // Initialize with 1..8
+    const data = buffer.contents().?;
+    for (data, 0..) |*v, i| v.* = @floatFromInt(i + 1);
+
+    // Scale by 2.0 using setBytes
+    device.submit(&.{
+        zmtl.Command.init()
+            .compute(pipeline, .{})
+            .setBuffer(buffer, 0, .{})
+            .setBytes(Params{ .scale = 2.0, .offset = 0 }, 1)
+            .dispatch1d(pipeline, 8),
+    });
+
+    // Verify: should be [2, 4, 6, 8, 10, 12, 14, 16]
+    for (data, 0..) |val, i| {
+        try std.testing.expectEqual(@as(f32, @floatFromInt((i + 1) * 2)), val);
+    }
+}
+
+test "lesson_05_storage_modes" {
+    var device = try zmtl.Device.default();
+
+    // Shared buffer - CPU accessible
+    const shared_buf = try device.createBufferWithMode(f32, 4, .shared);
+    try std.testing.expect(shared_buf.contents() != null);
+
+    // Private buffer - GPU only, not CPU accessible
+    const private_buf = try device.createBufferWithMode(f32, 4, .private);
+    try std.testing.expect(private_buf.contents() == null);
+}
+
+test "lesson_06_concurrent_dispatch" {
+    const scale_shader: [*:0]const u8 =
+        \\#include <metal_stdlib>
+        \\using namespace metal;
+        \\
+        \\struct Params {
+        \\    float scale;
+        \\    uint offset;
+        \\};
+        \\
+        \\kernel void scale_kernel(
+        \\    device float* data [[buffer(0)]],
+        \\    constant Params& params [[buffer(1)]],
+        \\    uint tid [[thread_position_in_grid]]
+        \\) {
+        \\    data[tid + params.offset] *= params.scale;
+        \\}
+    ;
+
+    const Params = extern struct {
+        scale: f32,
+        offset: u32,
+    };
+
+    var device = try zmtl.Device.default();
+    const pipeline = try device.createComputePipeline(scale_shader, "scale_kernel");
+    var buffer = try device.createBuffer(f32, 8);
+
+    // Initialize with 1..8
+    const data = buffer.contents().?;
+    for (data, 0..) |*v, i| v.* = @floatFromInt(i + 1);
+
+    // Concurrent dispatch with barrier (x2 then x3 = x6)
+    device.submit(&.{
+        zmtl.Command.init()
+            .compute(pipeline, .{ .concurrent = true })
+            .setBuffer(buffer, 0, .{})
+            .setBytes(Params{ .scale = 2.0, .offset = 0 }, 1)
+            .dispatch1d(pipeline, 8)
+            .barrier(.buffers) // Required for concurrent when same buffer
+            .setBytes(Params{ .scale = 3.0, .offset = 0 }, 1)
+            .dispatch1d(pipeline, 8),
+    });
+
+    // Verify: should be [6, 12, 18, 24, 30, 36, 42, 48]
+    for (data, 0..) |val, i| {
+        try std.testing.expectEqual(@as(f32, @floatFromInt((i + 1) * 6)), val);
+    }
+}
+
+test "lesson_07_events" {
+    const scale_shader: [*:0]const u8 =
+        \\#include <metal_stdlib>
+        \\using namespace metal;
+        \\
+        \\struct Params {
+        \\    float scale;
+        \\    uint offset;
+        \\};
+        \\
+        \\kernel void scale_kernel(
+        \\    device float* data [[buffer(0)]],
+        \\    constant Params& params [[buffer(1)]],
+        \\    uint tid [[thread_position_in_grid]]
+        \\) {
+        \\    data[tid + params.offset] *= params.scale;
+        \\}
+    ;
+
+    const Params = extern struct {
+        scale: f32,
+        offset: u32,
+    };
+
+    var device = try zmtl.Device.default();
+    const pipeline = try device.createComputePipeline(scale_shader, "scale_kernel");
+    var buffer = try device.createBuffer(f32, 8);
+
+    // Initialize with 1..8
+    const data = buffer.contents().?;
+    for (data, 0..) |*v, i| v.* = @floatFromInt(i + 1);
+
+    // Event for cross-submission synchronization
+    const event = zmtl.Event.init(device);
+
+    // First submission: x10, then signal
+    const fence1 = device.submitAsync(&.{
+        zmtl.Command.init()
+            .compute(pipeline, .{})
+            .setBuffer(buffer, 0, .{})
+            .setBytes(Params{ .scale = 10.0, .offset = 0 }, 1)
+            .dispatch1d(pipeline, 8)
+            .signalEvent(event, 1),
+    });
+
+    // Second submission: wait, then x0.1 (back to original)
+    const fence2 = device.submitAsync(&.{
+        zmtl.Command.init()
+            .waitEvent(event, 1)
+            .compute(pipeline, .{})
+            .setBuffer(buffer, 0, .{})
+            .setBytes(Params{ .scale = 0.1, .offset = 0 }, 1)
+            .dispatch1d(pipeline, 8),
+    });
+
+    fence1.wait();
+    fence2.wait();
+
+    // Verify: should be back to approximately [1, 2, 3, 4, 5, 6, 7, 8]
+    for (data, 0..) |val, i| {
+        try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(i + 1)), val, 0.01);
+    }
+}
+
+test "lesson_08_acceleration_structure" {
+    var device = try zmtl.Device.default();
+
+    // Skip if ray tracing not supported
+    if (!device.supportsRaytracing()) {
+        return;
+    }
+
+    // Create vertex buffer for a simple triangle (3 vertices * 3 floats)
+    const vertices = [_]f32{
+        0.0, 0.0, 0.0, // v0
+        1.0, 0.0, 0.0, // v1
+        0.5, 1.0, 0.0, // v2
+    };
+
+    var vertex_buffer = try device.createBuffer(f32, vertices.len);
+    @memcpy(vertex_buffer.contents().?, &vertices);
+
+    // Create index buffer
+    const indices = [_]u32{ 0, 1, 2 };
+    var index_buffer = try device.createBuffer(u32, indices.len);
+    @memcpy(index_buffer.contents().?, &indices);
+
+    // Create triangle geometry descriptor
+    const triangle_geo = zmtl.TriangleGeometryDescriptor.init()
+        .setVertexBuffer(vertex_buffer, .{ .stride = 12 })
+        .setIndexBuffer(index_buffer, .uint32, .{})
+        .setTriangleCount(1);
+
+    // Create BLAS descriptor
+    var blas_desc = zmtl.PrimitiveAccelerationStructureDescriptor.init();
+    blas_desc.addGeometry(triangle_geo);
+    blas_desc.build();
+
+    // Get sizes
+    const sizes = device.getAccelerationStructureSizes(blas_desc);
+    try std.testing.expect(sizes.acceleration_structure_size > 0);
+    try std.testing.expect(sizes.build_scratch_buffer_size > 0);
+
+    // Create acceleration structure and scratch buffer
+    const blas = try device.createAccelerationStructure(sizes.acceleration_structure_size);
+    const scratch_buffer = try device.createBuffer(u8, sizes.build_scratch_buffer_size);
+
+    // Build the BLAS
+    device.submit(&.{
+        zmtl.Command.init()
+            .accel()
+            .buildAccelerationStructure(blas, blas_desc, scratch_buffer, .{}),
+    });
+
+    // If we got here without crashing, the test passed
+    try std.testing.expect(blas.size() > 0);
+}
+
+// =============================================================================
+// Lesson 05: Image Processing with Textures
+// =============================================================================
+
+test "lesson_05_convolution" {
+    var device = try zmtl.Device.default();
+
+    // Convolution shader with kernel weights
+    const shader_source: [*:0]const u8 =
+        \\#include <metal_stdlib>
+        \\using namespace metal;
+        \\
+        \\kernel void convolve(
+        \\    texture2d<float, access::read> input [[texture(0)]],
+        \\    texture2d<float, access::write> output [[texture(1)]],
+        \\    constant float* weights [[buffer(0)]],
+        \\    constant int& kernel_radius [[buffer(1)]],
+        \\    uint2 gid [[thread_position_in_grid]]
+        \\) {
+        \\    int width = input.get_width();
+        \\    int height = input.get_height();
+        \\
+        \\    // Bounds check
+        \\    if (gid.x >= uint(width) || gid.y >= uint(height)) return;
+        \\
+        \\    float4 sum = float4(0.0);
+        \\    int kernel_size = 2 * kernel_radius + 1;
+        \\    int weight_idx = 0;
+        \\
+        \\    for (int dy = -kernel_radius; dy <= kernel_radius; dy++) {
+        \\        for (int dx = -kernel_radius; dx <= kernel_radius; dx++) {
+        \\            // Clamp coordinates to texture bounds
+        \\            int sx = clamp(int(gid.x) + dx, 0, width - 1);
+        \\            int sy = clamp(int(gid.y) + dy, 0, height - 1);
+        \\
+        \\            float4 sample = input.read(uint2(sx, sy));
+        \\            sum += sample * weights[weight_idx];
+        \\            weight_idx++;
+        \\        }
+        \\    }
+        \\
+        \\    // Clamp result to valid range
+        \\    sum = clamp(sum, 0.0, 1.0);
+        \\    sum.a = 1.0; // Preserve alpha
+        \\    output.write(sum, gid);
+        \\}
+    ;
+
+    const pipeline = try device.createComputePipeline(shader_source, "convolve");
+
+    const width: u64 = 256;
+    const height: u64 = 256;
+    const channels: u64 = 4;
+    var pixels: [width * height * channels]u8 = undefined;
+
+    // Create a test pattern: white rectangle in center on black background
+    for (0..height) |y| {
+        for (0..width) |x| {
+            const idx = (y * width + x) * channels;
+            const in_center = x >= width / 4 and x < 3 * width / 4 and
+                y >= height / 4 and y < 3 * height / 4;
+
+            if (in_center) {
+                pixels[idx + 0] = 255; // R
+                pixels[idx + 1] = 255; // G
+                pixels[idx + 2] = 255; // B
+                pixels[idx + 3] = 255; // A
+            } else {
+                pixels[idx + 0] = 0;
+                pixels[idx + 1] = 0;
+                pixels[idx + 2] = 0;
+                pixels[idx + 3] = 255;
+            }
+        }
+    }
+
+    const input_tex = try device.createTexture(width, height, zmtl.PixelFormat.rgba8unorm, zmtl.TextureUsage.read);
+    const output_tex = try device.createTexture(width, height, zmtl.PixelFormat.rgba8unorm, zmtl.TextureUsage.write);
+
+    input_tex.upload(&pixels);
+
+    // Save input image
+    try input_tex.savePPM("input.ppm", &pixels);
+
+    // Edge detection kernel (Laplacian)
+    const kernel_weights = [9]f32{ -1, -1, -1, -1, 8, -1, -1, -1, -1 };
+    const kernel_radius: i32 = 1; // 3x3 kernel has radius 1
+
+    device.submit(&.{
+        zmtl.Command.init()
+            .compute(pipeline, .{})
+            .setTexture(input_tex, 0)
+            .setTexture(output_tex, 1)
+            .setBytes(&kernel_weights, 0)
+            .setBytes(&kernel_radius, 1)
+            .dispatch2d(width, height),
+    });
+
+    // Read back result
+    var result: [width * height * channels]u8 = undefined;
+    output_tex.download(&result);
+
+    // Save output image
+    try output_tex.savePPM("output.ppm", &result);
+
+    // Verify edge detection worked: center should be black (no edges inside),
+    // but the border of the rectangle should have non-zero values
+    // Check a pixel on the edge of the white rectangle
+    const edge_x = width / 4;
+    const edge_y = height / 2;
+    const edge_idx = (edge_y * width + edge_x) * channels;
+
+    // Edge pixels should be non-zero (detected edge)
+    const edge_brightness = @as(u32, result[edge_idx]) + result[edge_idx + 1] + result[edge_idx + 2];
+    try std.testing.expect(edge_brightness > 0);
+
+    // Center pixel should be near zero (no edge in uniform region)
+    const center_x = width / 2;
+    const center_y = height / 2;
+    const center_idx = (center_y * width + center_x) * channels;
+    const center_brightness = @as(u32, result[center_idx]) + result[center_idx + 1] + result[center_idx + 2];
+    try std.testing.expect(center_brightness < 50); // Allow some tolerance
 }

@@ -1533,4 +1533,188 @@ void MTLCompileOptionsSetPreserveInvariance(MTLCompileOptionsRef options, bool p
     if (options) static_cast<MTL::CompileOptions*>(options)->setPreserveInvariance(preserve);
 }
 
+// =============================================================================
+// Acceleration Structures
+// =============================================================================
+
+MTLAccelerationStructureSizes MTLDeviceGetAccelerationStructureSizes(MTLDeviceRef device, MTLAccelerationStructureDescriptorRef descriptor) {
+    MTLAccelerationStructureSizes result = {0, 0, 0};
+    if (device && descriptor) {
+        auto sizes = static_cast<MTL::Device*>(device)->accelerationStructureSizes(static_cast<MTL::AccelerationStructureDescriptor*>(descriptor));
+        result.accelerationStructureSize = sizes.accelerationStructureSize;
+        result.buildScratchBufferSize = sizes.buildScratchBufferSize;
+        result.refitScratchBufferSize = sizes.refitScratchBufferSize;
+    }
+    return result;
+}
+
+MTLAccelerationStructureRef MTLDeviceNewAccelerationStructureWithSize(MTLDeviceRef device, uint64_t size) {
+    return device ? static_cast<MTL::Device*>(device)->newAccelerationStructure(size) : nullptr;
+}
+
+MTLAccelerationStructureRef MTLDeviceNewAccelerationStructureWithDescriptor(MTLDeviceRef device, MTLAccelerationStructureDescriptorRef descriptor) {
+    return (device && descriptor) ? static_cast<MTL::Device*>(device)->newAccelerationStructure(static_cast<MTL::AccelerationStructureDescriptor*>(descriptor)) : nullptr;
+}
+
+uint64_t MTLAccelerationStructureSize(MTLAccelerationStructureRef accel) {
+    return accel ? static_cast<MTL::AccelerationStructure*>(accel)->size() : 0;
+}
+
+// Primitive Acceleration Structure Descriptor
+MTLPrimitiveAccelerationStructureDescriptorRef MTLPrimitiveAccelerationStructureDescriptorCreate(void) {
+    return MTL::PrimitiveAccelerationStructureDescriptor::alloc()->init();
+}
+
+void MTLPrimitiveAccelerationStructureDescriptorSetGeometryDescriptors(MTLPrimitiveAccelerationStructureDescriptorRef desc, void** geometryDescriptors, uint64_t count) {
+    if (desc && geometryDescriptors && count > 0) {
+        auto* array = NS::Array::array(reinterpret_cast<NS::Object**>(geometryDescriptors), count);
+        static_cast<MTL::PrimitiveAccelerationStructureDescriptor*>(desc)->setGeometryDescriptors(array);
+    }
+}
+
+// Triangle Geometry Descriptor
+MTLAccelerationStructureTriangleGeometryDescriptorRef MTLAccelerationStructureTriangleGeometryDescriptorCreate(void) {
+    return MTL::AccelerationStructureTriangleGeometryDescriptor::alloc()->init();
+}
+
+void MTLAccelerationStructureTriangleGeometryDescriptorSetVertexBuffer(MTLAccelerationStructureTriangleGeometryDescriptorRef desc, MTLBufferRef buffer) {
+    if (desc) static_cast<MTL::AccelerationStructureTriangleGeometryDescriptor*>(desc)->setVertexBuffer(static_cast<MTL::Buffer*>(buffer));
+}
+
+void MTLAccelerationStructureTriangleGeometryDescriptorSetVertexBufferOffset(MTLAccelerationStructureTriangleGeometryDescriptorRef desc, uint64_t offset) {
+    if (desc) static_cast<MTL::AccelerationStructureTriangleGeometryDescriptor*>(desc)->setVertexBufferOffset(offset);
+}
+
+void MTLAccelerationStructureTriangleGeometryDescriptorSetVertexStride(MTLAccelerationStructureTriangleGeometryDescriptorRef desc, uint64_t stride) {
+    if (desc) static_cast<MTL::AccelerationStructureTriangleGeometryDescriptor*>(desc)->setVertexStride(stride);
+}
+
+void MTLAccelerationStructureTriangleGeometryDescriptorSetIndexBuffer(MTLAccelerationStructureTriangleGeometryDescriptorRef desc, MTLBufferRef buffer) {
+    if (desc) static_cast<MTL::AccelerationStructureTriangleGeometryDescriptor*>(desc)->setIndexBuffer(static_cast<MTL::Buffer*>(buffer));
+}
+
+void MTLAccelerationStructureTriangleGeometryDescriptorSetIndexBufferOffset(MTLAccelerationStructureTriangleGeometryDescriptorRef desc, uint64_t offset) {
+    if (desc) static_cast<MTL::AccelerationStructureTriangleGeometryDescriptor*>(desc)->setIndexBufferOffset(offset);
+}
+
+void MTLAccelerationStructureTriangleGeometryDescriptorSetIndexType(MTLAccelerationStructureTriangleGeometryDescriptorRef desc, MTLIndexType type) {
+    if (desc) static_cast<MTL::AccelerationStructureTriangleGeometryDescriptor*>(desc)->setIndexType(static_cast<MTL::IndexType>(type));
+}
+
+void MTLAccelerationStructureTriangleGeometryDescriptorSetTriangleCount(MTLAccelerationStructureTriangleGeometryDescriptorRef desc, uint64_t count) {
+    if (desc) static_cast<MTL::AccelerationStructureTriangleGeometryDescriptor*>(desc)->setTriangleCount(count);
+}
+
+// Bounding Box Geometry Descriptor
+MTLAccelerationStructureBoundingBoxGeometryDescriptorRef MTLAccelerationStructureBoundingBoxGeometryDescriptorCreate(void) {
+    return MTL::AccelerationStructureBoundingBoxGeometryDescriptor::alloc()->init();
+}
+
+void MTLAccelerationStructureBoundingBoxGeometryDescriptorSetBoundingBoxBuffer(MTLAccelerationStructureBoundingBoxGeometryDescriptorRef desc, MTLBufferRef buffer) {
+    if (desc) static_cast<MTL::AccelerationStructureBoundingBoxGeometryDescriptor*>(desc)->setBoundingBoxBuffer(static_cast<MTL::Buffer*>(buffer));
+}
+
+void MTLAccelerationStructureBoundingBoxGeometryDescriptorSetBoundingBoxBufferOffset(MTLAccelerationStructureBoundingBoxGeometryDescriptorRef desc, uint64_t offset) {
+    if (desc) static_cast<MTL::AccelerationStructureBoundingBoxGeometryDescriptor*>(desc)->setBoundingBoxBufferOffset(offset);
+}
+
+void MTLAccelerationStructureBoundingBoxGeometryDescriptorSetBoundingBoxStride(MTLAccelerationStructureBoundingBoxGeometryDescriptorRef desc, uint64_t stride) {
+    if (desc) static_cast<MTL::AccelerationStructureBoundingBoxGeometryDescriptor*>(desc)->setBoundingBoxStride(stride);
+}
+
+void MTLAccelerationStructureBoundingBoxGeometryDescriptorSetBoundingBoxCount(MTLAccelerationStructureBoundingBoxGeometryDescriptorRef desc, uint64_t count) {
+    if (desc) static_cast<MTL::AccelerationStructureBoundingBoxGeometryDescriptor*>(desc)->setBoundingBoxCount(count);
+}
+
+// Instance Acceleration Structure Descriptor
+MTLInstanceAccelerationStructureDescriptorRef MTLInstanceAccelerationStructureDescriptorCreate(void) {
+    return MTL::InstanceAccelerationStructureDescriptor::alloc()->init();
+}
+
+void MTLInstanceAccelerationStructureDescriptorSetInstanceDescriptorBuffer(MTLInstanceAccelerationStructureDescriptorRef desc, MTLBufferRef buffer) {
+    if (desc) static_cast<MTL::InstanceAccelerationStructureDescriptor*>(desc)->setInstanceDescriptorBuffer(static_cast<MTL::Buffer*>(buffer));
+}
+
+void MTLInstanceAccelerationStructureDescriptorSetInstanceDescriptorBufferOffset(MTLInstanceAccelerationStructureDescriptorRef desc, uint64_t offset) {
+    if (desc) static_cast<MTL::InstanceAccelerationStructureDescriptor*>(desc)->setInstanceDescriptorBufferOffset(offset);
+}
+
+void MTLInstanceAccelerationStructureDescriptorSetInstanceDescriptorStride(MTLInstanceAccelerationStructureDescriptorRef desc, uint64_t stride) {
+    if (desc) static_cast<MTL::InstanceAccelerationStructureDescriptor*>(desc)->setInstanceDescriptorStride(stride);
+}
+
+void MTLInstanceAccelerationStructureDescriptorSetInstanceCount(MTLInstanceAccelerationStructureDescriptorRef desc, uint64_t count) {
+    if (desc) static_cast<MTL::InstanceAccelerationStructureDescriptor*>(desc)->setInstanceCount(count);
+}
+
+void MTLInstanceAccelerationStructureDescriptorSetInstancedAccelerationStructures(MTLInstanceAccelerationStructureDescriptorRef desc, MTLAccelerationStructureRef* structures, uint64_t count) {
+    if (desc && structures && count > 0) {
+        auto* array = NS::Array::array(reinterpret_cast<NS::Object**>(structures), count);
+        static_cast<MTL::InstanceAccelerationStructureDescriptor*>(desc)->setInstancedAccelerationStructures(array);
+    }
+}
+
+// Acceleration Structure Command Encoder
+void MTLAccelerationStructureCommandEncoderBuildAccelerationStructure(MTLAccelerationStructureCommandEncoderRef encoder, MTLAccelerationStructureRef accel, MTLAccelerationStructureDescriptorRef descriptor, MTLBufferRef scratchBuffer, uint64_t scratchBufferOffset) {
+    if (encoder && accel && descriptor && scratchBuffer) {
+        static_cast<MTL::AccelerationStructureCommandEncoder*>(encoder)->buildAccelerationStructure(
+            static_cast<MTL::AccelerationStructure*>(accel),
+            static_cast<MTL::AccelerationStructureDescriptor*>(descriptor),
+            static_cast<MTL::Buffer*>(scratchBuffer),
+            scratchBufferOffset
+        );
+    }
+}
+
+void MTLAccelerationStructureCommandEncoderRefitAccelerationStructure(MTLAccelerationStructureCommandEncoderRef encoder, MTLAccelerationStructureRef sourceAccel, MTLAccelerationStructureDescriptorRef descriptor, MTLAccelerationStructureRef destAccel, MTLBufferRef scratchBuffer, uint64_t scratchBufferOffset) {
+    if (encoder && sourceAccel && descriptor && scratchBuffer) {
+        static_cast<MTL::AccelerationStructureCommandEncoder*>(encoder)->refitAccelerationStructure(
+            static_cast<MTL::AccelerationStructure*>(sourceAccel),
+            static_cast<MTL::AccelerationStructureDescriptor*>(descriptor),
+            static_cast<MTL::AccelerationStructure*>(destAccel),
+            static_cast<MTL::Buffer*>(scratchBuffer),
+            scratchBufferOffset
+        );
+    }
+}
+
+void MTLAccelerationStructureCommandEncoderCopyAccelerationStructure(MTLAccelerationStructureCommandEncoderRef encoder, MTLAccelerationStructureRef sourceAccel, MTLAccelerationStructureRef destAccel) {
+    if (encoder && sourceAccel && destAccel) {
+        static_cast<MTL::AccelerationStructureCommandEncoder*>(encoder)->copyAccelerationStructure(
+            static_cast<MTL::AccelerationStructure*>(sourceAccel),
+            static_cast<MTL::AccelerationStructure*>(destAccel)
+        );
+    }
+}
+
+void MTLAccelerationStructureCommandEncoderWriteCompactedAccelerationStructureSize(MTLAccelerationStructureCommandEncoderRef encoder, MTLAccelerationStructureRef accel, MTLBufferRef buffer, uint64_t offset) {
+    if (encoder && accel && buffer) {
+        static_cast<MTL::AccelerationStructureCommandEncoder*>(encoder)->writeCompactedAccelerationStructureSize(
+            static_cast<MTL::AccelerationStructure*>(accel),
+            static_cast<MTL::Buffer*>(buffer),
+            offset
+        );
+    }
+}
+
+void MTLAccelerationStructureCommandEncoderCopyAndCompactAccelerationStructure(MTLAccelerationStructureCommandEncoderRef encoder, MTLAccelerationStructureRef sourceAccel, MTLAccelerationStructureRef destAccel) {
+    if (encoder && sourceAccel && destAccel) {
+        static_cast<MTL::AccelerationStructureCommandEncoder*>(encoder)->copyAndCompactAccelerationStructure(
+            static_cast<MTL::AccelerationStructure*>(sourceAccel),
+            static_cast<MTL::AccelerationStructure*>(destAccel)
+        );
+    }
+}
+
+void MTLAccelerationStructureCommandEncoderEndEncoding(MTLAccelerationStructureCommandEncoderRef encoder) {
+    if (encoder) static_cast<MTL::AccelerationStructureCommandEncoder*>(encoder)->endEncoding();
+}
+
+// Compute Encoder - Acceleration Structure
+void MTLComputeCommandEncoderSetAccelerationStructure(MTLComputeCommandEncoderRef encoder, MTLAccelerationStructureRef accel, uint64_t index) {
+    if (encoder && accel) {
+        static_cast<MTL::ComputeCommandEncoder*>(encoder)->setAccelerationStructure(static_cast<MTL::AccelerationStructure*>(accel), index);
+    }
+}
+
 } // extern "C"
