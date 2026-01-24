@@ -671,54 +671,58 @@ test "lesson_06_concurrent_dispatch" {
 //     }
 // }
 
-// test "lesson_08_acceleration_structure" {
-//     var device = try zmtl.Device.default();
+test "lesson_08_acceleration_structure" {
+    var device = try zmtl.Device.default();
 
-//     // Skip if ray tracing not supported
-//     if (!device.supportsRaytracing()) {
-//         return;
-//     }
+    // Skip if ray tracing not supported
+    if (!device.supportsRaytracing()) {
+        return;
+    }
 
-//     // Create vertex buffer for a simple triangle (3 vertices * 3 floats)
-//     const vertices = [_]f32{
-//         0.0, 0.0, 0.0, // v0
-//         1.0, 0.0, 0.0, // v1
-//         0.5, 1.0, 0.0, // v2
-//     };
+    // Create vertex buffer for a simple triangle (3 vertices * 3 floats)
+    const vertices = [_]f32{
+        0.0, 0.0, 0.0, // v0
+        1.0, 0.0, 0.0, // v1
+        0.5, 1.0, 0.0, // v2
+    };
 
-//     var vertex_buffer = try device.createBuffer(f32, vertices.len);
-//     @memcpy(vertex_buffer.contents().?, &vertices);
+    var vertex_buffer = try device.createBuffer(f32, vertices.len);
+    @memcpy(vertex_buffer.contents().?, &vertices);
 
-//     // Create index buffer
-//     const indices = [_]u32{ 0, 1, 2 };
-//     var index_buffer = try device.createBuffer(u32, indices.len);
-//     @memcpy(index_buffer.contents().?, &indices);
+    // Create index buffer
+    const indices = [_]u32{ 0, 1, 2 };
+    var index_buffer = try device.createBuffer(u32, indices.len);
+    @memcpy(index_buffer.contents().?, &indices);
 
-//     // Create triangle geometry descriptor
-//     const triangle_geo = zmtl.TriangleGeometryDescriptor.init()
-//         .setVertexBuffer(vertex_buffer, .{ .stride = 12 })
-//         .setIndexBuffer(index_buffer, .uint32, .{})
-//         .setTriangleCount(1);
+    // Create triangle geometry descriptor
+    const triangle_geo = zmtl.TriangleGeometryDescriptor.init()
+        .setVertexBuffer(vertex_buffer, .{ .stride = 12 })
+        .setIndexBuffer(index_buffer, .uint32, .{})
+        .setTriangleCount(1);
 
-//     // Create BLAS descriptor
-//     var blas_desc = zmtl.PrimitiveAccelerationStructureDescriptor.init();
-//     blas_desc.addGeometry(triangle_geo);
-//     blas_desc.build();
+    // Create BLAS descriptor
+    var blas_desc = zmtl.PrimitiveAccelerationStructureDescriptor.init();
+    blas_desc.addGeometry(triangle_geo);
+    blas_desc.build();
 
-//     // Get sizes
-//     const sizes = device.getAccelerationStructureSizes(blas_desc);
-//     try std.testing.expect(sizes.acceleration_structure_size > 0);
-//     try std.testing.expect(sizes.build_scratch_buffer_size > 0);
+    // Get sizes
+    const sizes = device.getAccelerationStructureSizes(blas_desc);
+    try std.testing.expect(sizes.acceleration_structure_size > 0);
+    try std.testing.expect(sizes.build_scratch_buffer_size > 0);
 
-//     // Create acceleration structure and scratch buffer
-//     const blas = try device.createAccelerationStructure(sizes.acceleration_structure_size);
-//     const scratch_buffer = try device.createBuffer(u8, sizes.build_scratch_buffer_size);
+    // Create acceleration structure and scratch buffer
+    const blas = try device.createAccelerationStructure(sizes.acceleration_structure_size);
+    const scratch_buffer = try device.createBuffer(u8, sizes.build_scratch_buffer_size);
 
-//     // TODO: Accel command builder not yet implemented in new API
-//     // For now, just verify structures were created successfully
-//     _ = scratch_buffer;
-//     try std.testing.expect(blas.size() == 0); // Not built yet
-// }
+    // Build the BLAS using new accel() API
+    device.submit(
+        zmtl.accel()
+            .build(blas, blas_desc, scratch_buffer, .{}),
+    );
+
+    // If we got here without crashing, the test passed
+    try std.testing.expect(blas.size() > 0);
+}
 
 // =============================================================================
 // Lesson 05: Image Processing with Textures

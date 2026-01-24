@@ -358,9 +358,9 @@ pub const InstanceAccelerationStructureDescriptor = struct {
     }
 
     /// Add a BLAS that instances can reference
-    pub fn addInstancedAccelerationStructure(self: *InstanceAccelerationStructureDescriptor, accel: AccelerationStructure) void {
+    pub fn addInstancedAccelerationStructure(self: *InstanceAccelerationStructureDescriptor, accel_struct: AccelerationStructure) void {
         if (self.blas_count < MAX_INSTANCES) {
-            self.blas_handles[self.blas_count] = accel.handle;
+            self.blas_handles[self.blas_count] = accel_struct.handle;
             self.blas_count += 1;
         }
     }
@@ -539,9 +539,10 @@ pub const Texture = struct {
 // Comptime Command Builder API
 // =============================================================================
 
-const EncoderKind = enum { compute, blit };
+const EncoderKind = enum { compute, blit, accel };
 
 // Data types - the type itself identifies the operation
+// Compute operations
 const PipelineBinding = struct { handle: mtl.MTLComputePipelineStateRef };
 const BufferBinding = struct { handle: mtl.MTLBufferRef, offset: u64, index: u64 };
 const TextureBinding = struct { handle: mtl.MTLTextureRef, index: u64 };
@@ -549,8 +550,17 @@ const BytesBinding = struct { ptr: *const anyopaque, len: usize, index: u64 };
 const DispatchInfo = struct { grid: Size, threads: Size };
 const Dispatch2dInfo = struct { width: u64, height: u64 };
 const BarrierInfo = struct { scope: BarrierScope };
+
+// Blit operations
 const CopyInfo = struct { src: mtl.MTLBufferRef, src_offset: u64, dst: mtl.MTLBufferRef, dst_offset: u64, size: u64 };
 const FillInfo = struct { buffer: mtl.MTLBufferRef, offset: u64, size: u64, value: u8 };
+
+// Accel operations
+const AccelBuildInfo = struct { accel: mtl.MTLAccelerationStructureRef, descriptor: mtl.MTLAccelerationStructureDescriptorRef, scratch: mtl.MTLBufferRef, scratch_offset: u64 };
+const AccelRefitInfo = struct { src: mtl.MTLAccelerationStructureRef, descriptor: mtl.MTLAccelerationStructureDescriptorRef, dst: mtl.MTLAccelerationStructureRef, scratch: mtl.MTLBufferRef, scratch_offset: u64 };
+const AccelCopyInfo = struct { src: mtl.MTLAccelerationStructureRef, dst: mtl.MTLAccelerationStructureRef };
+const AccelCompactInfo = struct { src: mtl.MTLAccelerationStructureRef, dst: mtl.MTLAccelerationStructureRef };
+const AccelWriteSizeInfo = struct { accel: mtl.MTLAccelerationStructureRef, buffer: mtl.MTLBufferRef, offset: u64 };
 
 fn fieldName(comptime i: usize) [:0]const u8 {
     return std.fmt.comptimePrint("f{d}", .{i});
@@ -754,6 +764,122 @@ pub fn Blit(comptime types: []const type) type {
     };
 }
 
+/// Accel command builder - for acceleration structure operations
+pub fn Accel(comptime types: []const type) type {
+    return struct {
+        data: Data,
+        const Self = @This();
+        const Data = DataStruct(types);
+        const n = types.len;
+        pub const encoder_kind: EncoderKind = .accel;
+
+        pub fn init() Accel(&[_]type{}) {
+            return .{ .data = .{} };
+        }
+
+        pub fn build(
+            self: Self,
+            acceleration_structure: AccelerationStructure,
+            descriptor: anytype,
+            scratch_buffer: anytype,
+            opts: struct { scratch_offset: u64 = 0 },
+        ) Accel(types ++ &[_]type{AccelBuildInfo}) {
+            const desc_handle = if (@hasField(@TypeOf(descriptor), "handle")) descriptor.handle else descriptor;
+            const scratch_handle = if (@hasField(@TypeOf(scratch_buffer), "handle")) scratch_buffer.handle else scratch_buffer;
+            var result: Accel(types ++ &[_]type{AccelBuildInfo}) = .{ .data = undefined };
+            inline for (0..n) |i| @field(result.data, fieldName(i)) = @field(self.data, fieldName(i));
+            @field(result.data, fieldName(n)) = .{
+                .accel = acceleration_structure.handle,
+                .descriptor = desc_handle,
+                .scratch = scratch_handle,
+                .scratch_offset = opts.scratch_offset,
+            };
+            return result;
+        }
+
+        pub fn refit(
+            self: Self,
+            src: AccelerationStructure,
+            descriptor: anytype,
+            dst: AccelerationStructure,
+            scratch_buffer: anytype,
+            opts: struct { scratch_offset: u64 = 0 },
+        ) Accel(types ++ &[_]type{AccelRefitInfo}) {
+            const desc_handle = if (@hasField(@TypeOf(descriptor), "handle")) descriptor.handle else descriptor;
+            const scratch_handle = if (@hasField(@TypeOf(scratch_buffer), "handle")) scratch_buffer.handle else scratch_buffer;
+            var result: Accel(types ++ &[_]type{AccelRefitInfo}) = .{ .data = undefined };
+            inline for (0..n) |i| @field(result.data, fieldName(i)) = @field(self.data, fieldName(i));
+            @field(result.data, fieldName(n)) = .{
+                .src = src.handle,
+                .descriptor = desc_handle,
+                .dst = dst.handle,
+                .scratch = scratch_handle,
+                .scratch_offset = opts.scratch_offset,
+            };
+            return result;
+        }
+
+        pub fn copy(self: Self, src: AccelerationStructure, dst: AccelerationStructure) Accel(types ++ &[_]type{AccelCopyInfo}) {
+            var result: Accel(types ++ &[_]type{AccelCopyInfo}) = .{ .data = undefined };
+            inline for (0..n) |i| @field(result.data, fieldName(i)) = @field(self.data, fieldName(i));
+            @field(result.data, fieldName(n)) = .{ .src = src.handle, .dst = dst.handle };
+            return result;
+        }
+
+        pub fn copyAndCompact(self: Self, src: AccelerationStructure, dst: AccelerationStructure) Accel(types ++ &[_]type{AccelCompactInfo}) {
+            var result: Accel(types ++ &[_]type{AccelCompactInfo}) = .{ .data = undefined };
+            inline for (0..n) |i| @field(result.data, fieldName(i)) = @field(self.data, fieldName(i));
+            @field(result.data, fieldName(n)) = .{ .src = src.handle, .dst = dst.handle };
+            return result;
+        }
+
+        pub fn writeCompactedSize(
+            self: Self,
+            acceleration_structure: AccelerationStructure,
+            buffer: anytype,
+            opts: struct { offset: u64 = 0 },
+        ) Accel(types ++ &[_]type{AccelWriteSizeInfo}) {
+            const buf_handle = if (@hasField(@TypeOf(buffer), "handle")) buffer.handle else buffer;
+            var result: Accel(types ++ &[_]type{AccelWriteSizeInfo}) = .{ .data = undefined };
+            inline for (0..n) |i| @field(result.data, fieldName(i)) = @field(self.data, fieldName(i));
+            @field(result.data, fieldName(n)) = .{
+                .accel = acceleration_structure.handle,
+                .buffer = buf_handle,
+                .offset = opts.offset,
+            };
+            return result;
+        }
+
+        /// Encode accel commands to an encoder
+        pub fn encode(self: *const Self, enc: mtl.MTLAccelerationStructureCommandEncoderRef) void {
+            inline for (types, 0..) |T, i| {
+                const val = @field(self.data, fieldName(i));
+                if (T == AccelBuildInfo) {
+                    mtl.MTLAccelerationStructureCommandEncoderBuildAccelerationStructure(enc, val.accel, val.descriptor, val.scratch, val.scratch_offset);
+                } else if (T == AccelRefitInfo) {
+                    mtl.MTLAccelerationStructureCommandEncoderRefitAccelerationStructure(enc, val.src, val.descriptor, val.dst, val.scratch, val.scratch_offset);
+                } else if (T == AccelCopyInfo) {
+                    mtl.MTLAccelerationStructureCommandEncoderCopyAccelerationStructure(enc, val.src, val.dst);
+                } else if (T == AccelCompactInfo) {
+                    mtl.MTLAccelerationStructureCommandEncoderCopyAndCompactAccelerationStructure(enc, val.src, val.dst);
+                } else if (T == AccelWriteSizeInfo) {
+                    mtl.MTLAccelerationStructureCommandEncoderWriteCompactedAccelerationStructureSize(enc, val.accel, val.buffer, val.offset);
+                }
+            }
+        }
+
+        /// Finalize: create command buffer, encode, commit
+        pub fn finalize(self: *const Self, queue: mtl.MTLCommandQueueRef) mtl.MTLCommandBufferRef {
+            const cmd_buf = mtl.MTLCommandQueueCommandBuffer(queue) orelse @panic("Failed to create command buffer");
+            const enc = mtl.MTLCommandBufferAccelerationStructureCommandEncoder(cmd_buf);
+            self.encode(enc);
+            mtl.MTLAccelerationStructureCommandEncoderEndEncoding(enc);
+            mtl.MTLCommandBufferCommit(cmd_buf);
+            return cmd_buf;
+        }
+    };
+}
+
 /// Join multiple commands into a single submission
 pub fn join(commands: anytype) JoinedCommand(@TypeOf(commands)) {
     return .{ .commands = commands };
@@ -784,6 +910,10 @@ fn JoinedCommand(comptime T: type) type {
                         const enc = mtl.MTLCommandBufferBlitCommandEncoder(cmd_buf);
                         cmd.encode(enc);
                         mtl.MTLBlitCommandEncoderEndEncoding(enc);
+                    } else if (CmdType.encoder_kind == .accel) {
+                        const enc = mtl.MTLCommandBufferAccelerationStructureCommandEncoder(cmd_buf);
+                        cmd.encode(enc);
+                        mtl.MTLAccelerationStructureCommandEncoderEndEncoding(enc);
                     }
                 }
             }
@@ -805,6 +935,10 @@ pub fn computeConcurrent(pipeline: ComputePipeline) Compute(&[_]type{PipelineBin
 
 pub fn blit() Blit(&[_]type{}) {
     return Blit(&[_]type{}).init();
+}
+
+pub fn accel() Accel(&[_]type{}) {
+    return Accel(&[_]type{}).init();
 }
 
 /// Fence for async submission - call wait() to block until complete
