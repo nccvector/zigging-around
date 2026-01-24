@@ -175,6 +175,106 @@ Each thread processes one pixel. The 16x16 group size is a common sweet spot for
 
 ---
 
+## Ray Tracing & Acceleration Structures
+
+### Two-Level Hierarchy (BLAS/TLAS)
+
+Metal ray tracing uses a two-level acceleration structure:
+
+```
+TLAS (Top-Level Acceleration Structure)
+  ├── Instance 0 → BLAS A + Transform
+  ├── Instance 1 → BLAS A + Transform  (same geometry, different position)
+  ├── Instance 2 → BLAS B + Transform
+  └── Instance 3 → BLAS C + Transform
+```
+
+**BLAS (Bottom-Level)**: Contains actual geometry (triangles/bounding boxes) in local object space. Built once per unique mesh.
+
+**TLAS (Top-Level)**: Contains instances that reference BLASes with transforms. Rebuilt/updated per frame as objects move.
+
+**Key benefit**: A mesh used 1000 times only needs ONE BLAS. The TLAS has 1000 instances pointing to it with different transforms. Massive memory savings.
+
+### Build Strategies
+
+| Structure | Static Scene | Dynamic Scene |
+|-----------|-------------|---------------|
+| BLAS | PREFER_FAST_TRACE | PREFER_FAST_BUILD (if geometry changes) |
+| TLAS | PREFER_FAST_TRACE | PREFER_FAST_BUILD (usually) |
+
+**Why TLAS prefers FAST_BUILD**: TLASes are typically rebuilt every frame as objects move. The build cost matters more than trace cost since the structure is short-lived.
+
+**Why BLAS prefers FAST_TRACE**: BLASes for static geometry live for many frames. Investing in build quality pays off over thousands of ray queries.
+
+### Large Scene Best Practices
+
+**1. Instance Culling for TLAS**
+Don't include the entire scene in your TLAS. Cull based on:
+- Camera frustum (expanded slightly for reflections/shadows)
+- Maximum distance (can be less than rasterization far plane)
+- Object size (small objects culled at shorter distances)
+
+**2. BLAS Organization**
+- Fewer large BLASes > many small BLASes
+- Merge geometries whose world-space bounding boxes overlap
+- Avoid empty space inside BLAS (increases AABB hit tests)
+- Reduce overlapping between different BLASes
+
+**3. LOD for Ray Tracing**
+- Use simpler geometry for distant objects
+- Consider matching rasterization LOD (avoids self-intersection artifacts)
+- Lower detail LODs reduce dynamic BLAS update costs
+
+**4. Memory & Instancing**
+- Instance identical geometry instead of duplicating
+- Each instance can have unique materials and transforms
+- Instancing saves memory AND improves trace performance
+
+### Batching Acceleration Structure Operations
+
+Within a single accel encoder, you can batch:
+```
+AccelEncoder
+  ├── build(BLAS_A, ...)
+  ├── build(BLAS_B, ...)
+  ├── build(BLAS_C, ...)      ← All BLAS builds can overlap
+  ├── barrier                  ← Wait for BLAS builds
+  └── build(TLAS, ...)         ← TLAS references the BLASes
+```
+
+**Critical**: Only ONE barrier needed between all BLAS builds and TLAS build. Don't over-synchronize.
+
+### Update vs Rebuild
+
+| Operation | When to Use |
+|-----------|------------|
+| **Rebuild** | Geometry topology changed, or major structural changes |
+| **Refit** | Same topology, vertices just moved (animation) |
+
+Refit is faster but produces lower-quality acceleration structure. For skinned meshes with subtle animation, refit is usually fine. For explosions or major deformations, rebuild.
+
+### Compaction
+
+After building, acceleration structures often have wasted space. Compaction shrinks them:
+
+```
+1. Build BLAS (oversized)
+2. writeCompactedSize → get actual needed size
+3. Allocate smaller buffer
+4. copyAndCompact → copy to smaller buffer
+```
+
+**When to compact**: Static geometry that will be used for many frames. Not worth it for frequently rebuilt structures.
+
+### Performance Targets
+
+For real-time ray tracing:
+- Aim for BLAS/TLAS build + update under **2ms per frame**
+- Overlap accel builds with other work (G-buffer, shadow maps) using async compute
+- Profile and prune aggressively
+
+---
+
 ## What We Haven't Covered Yet
 
 ### Indirect Dispatch
@@ -192,11 +292,11 @@ Pack multiple resource bindings into a buffer. Reduces CPU overhead when binding
 ### Resource Heaps
 Pre-allocate GPU memory and sub-allocate from it. Reduces allocation overhead for dynamic resource creation.
 
-### Acceleration Structures
-Ray tracing primitives (BVH). Build once, trace many rays efficiently.
-
 ### Mesh Shaders
 Modern geometry pipeline (object → mesh → fragment). More flexible than vertex shaders for procedural geometry.
+
+### Intersection Functions
+Custom ray-primitive intersection for non-triangle geometry (curves, procedural shapes).
 
 ---
 
