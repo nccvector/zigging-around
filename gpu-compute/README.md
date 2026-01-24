@@ -33,14 +33,18 @@ Within a single compute encoder, you can batch:
 
 This all happens in one encoder, submitted as one unit:
 
-```
-ComputeEncoder
-  ├── setPipeline(A)
-  ├── setBuffer(...)
-  ├── dispatch(...)      ← runs pipeline A
-  ├── setPipeline(B)     ← switch pipeline (cheap!)
-  ├── setBuffer(...)
-  └── dispatch(...)      ← runs pipeline B
+```zig
+var cmd = try device.command();
+{
+    var enc = cmd.computeEncoder(pipelineA, .{});
+    defer enc.end();
+
+    enc.buffer(..., 0);
+    enc.dispatch1d(...);      // runs pipeline A
+    enc.pipeline(pipelineB);  // switch pipeline (cheap!)
+    enc.buffer(..., 0);
+    enc.dispatch1d(...);      // runs pipeline B
+}
 ```
 
 **Performance benefit**: Single encoder submission has less CPU overhead than multiple submissions.
@@ -49,11 +53,32 @@ ComputeEncoder
 
 A single CommandBuffer can contain multiple encoder types:
 
-```
-CommandBuffer
-  ├── ComputeEncoder → dispatch, dispatch, ...
-  ├── BlitEncoder    → copy, fill, ...
-  └── ComputeEncoder → dispatch, ...
+```zig
+var cmd = try device.command();
+
+// Compute pass
+{
+    var enc = cmd.computeEncoder(pipeline, .{});
+    defer enc.end();
+    enc.dispatch1d(...);
+    enc.dispatch1d(...);
+}
+
+// Blit pass
+{
+    var enc = cmd.blitEncoder();
+    defer enc.end();
+    enc.copy(src, dst);
+}
+
+// Another compute pass
+{
+    var enc = cmd.computeEncoder(pipeline, .{});
+    defer enc.end();
+    enc.dispatch1d(...);
+}
+
+device.submit(&cmd);
 ```
 
 Metal automatically handles encoder transitions. The GPU executes encoders sequentially within a command buffer.
@@ -73,13 +98,18 @@ Metal supports two dispatch modes within a compute encoder:
 - Must use explicit barriers for dependencies
 - Better GPU utilization when dispatches are independent
 
-```
+```zig
 // Concurrent mode - dispatches can overlap
-ConcurrentComputeEncoder
-  ├── dispatch(A)       ←
-  ├── dispatch(B)       ← A and B may run in parallel
-  ├── barrier(.buffers) ← wait for A,B to complete
-  └── dispatch(C)       ← C runs after barrier
+var cmd = try device.command();
+{
+    var enc = cmd.computeEncoder(pipeline, .{ .concurrent = true });
+    defer enc.end();
+
+    enc.dispatch1d(...);     // dispatch A
+    enc.dispatch1d(...);     // dispatch B (may run parallel with A)
+    enc.barrier(.buffers);   // wait for A,B to complete
+    enc.dispatch1d(...);     // dispatch C (runs after barrier)
+}
 ```
 
 **When to use concurrent**: When you have multiple independent dispatches that don't share data, or when you explicitly manage dependencies with barriers.
@@ -91,27 +121,40 @@ ConcurrentComputeEncoder
 ### Synchronous vs Asynchronous
 
 **Synchronous** (blocking):
-```
-submit(command)  // CPU blocks until GPU finishes
+```zig
+var cmd = try device.command();
+// ... encode work ...
+device.submit(&cmd);  // CPU blocks until GPU finishes
 ```
 
 **Asynchronous** (non-blocking):
-```
-fence = submitAsync(command)  // Returns immediately
+```zig
+var cmd = try device.command();
+// ... encode work ...
+const fence = device.submitAsync(&cmd);  // Returns immediately
 // ... do other CPU work ...
-fence.wait()  // Block when you need the result
+fence.wait();  // Block when you need the result
 ```
 
 ### Batching Multiple Submissions
 
 You can submit multiple command buffers without waiting:
 
-```
-fence1 = submitAsync(cmd1)
-fence2 = submitAsync(cmd2)
-fence3 = submitAsync(cmd3)
+```zig
+var cmd1 = try device.command();
+// ... encode work 1 ...
+const fence1 = device.submitAsync(&cmd1);
+
+var cmd2 = try device.command();
+// ... encode work 2 ...
+const fence2 = device.submitAsync(&cmd2);
+
+var cmd3 = try device.command();
+// ... encode work 3 ...
+const fence3 = device.submitAsync(&cmd3);
+
 // GPU processes all three, potentially in parallel across queues
-fence3.wait()  // Wait for all to complete
+fence3.wait();  // Wait for all to complete
 ```
 
 **Important**: Command buffers submitted to the SAME queue execute in order. Use multiple queues for true parallelism across command buffers.
@@ -156,9 +199,9 @@ Textures must declare their usage upfront:
 
 For image processing, dispatch a 2D grid:
 
-```
-Grid: (imageWidth/16, imageHeight/16, 1)
-ThreadsPerGroup: (16, 16, 1)
+```zig
+enc.dispatch2d(imageWidth, imageHeight);
+// Automatically uses 16x16 threadgroups
 ```
 
 Each thread processes one pixel. The 16x16 group size is a common sweet spot for most GPUs.
@@ -233,13 +276,18 @@ Don't include the entire scene in your TLAS. Cull based on:
 ### Batching Acceleration Structure Operations
 
 Within a single accel encoder, you can batch:
-```
-AccelEncoder
-  ├── build(BLAS_A, ...)
-  ├── build(BLAS_B, ...)
-  ├── build(BLAS_C, ...)      ← All BLAS builds can overlap
-  ├── barrier                  ← Wait for BLAS builds
-  └── build(TLAS, ...)         ← TLAS references the BLASes
+```zig
+var cmd = try device.command();
+{
+    var enc = cmd.accelEncoder();
+    defer enc.end();
+
+    enc.build(blas_a, blas_a_desc, scratch_a);
+    enc.build(blas_b, blas_b_desc, scratch_b);
+    enc.build(blas_c, blas_c_desc, scratch_c);  // All BLAS builds can overlap
+    enc.barrier();                              // Wait for BLAS builds
+    enc.build(tlas, tlas_desc, scratch_tlas);   // TLAS references the BLASes
+}
 ```
 
 **Critical**: Only ONE barrier needed between all BLAS builds and TLAS build. Don't over-synchronize.
@@ -257,11 +305,29 @@ Refit is faster but produces lower-quality acceleration structure. For skinned m
 
 After building, acceleration structures often have wasted space. Compaction shrinks them:
 
-```
-1. Build BLAS (oversized)
-2. writeCompactedSize → get actual needed size
-3. Allocate smaller buffer
-4. copyAndCompact → copy to smaller buffer
+```zig
+// 1. Build BLAS (oversized)
+var cmd1 = try device.command();
+{
+    var enc = cmd1.accelEncoder();
+    defer enc.end();
+    enc.build(blas, desc, scratch);
+    enc.writeCompactedSize(blas, size_buf, 0);
+}
+device.submit(&cmd1);
+
+// 2. Read compacted size and allocate smaller buffer
+const compacted_size = size_buf.contents().?[0];
+const compacted_blas = try device.accelerationStructure(compacted_size);
+
+// 3. Compact
+var cmd2 = try device.command();
+{
+    var enc = cmd2.accelEncoder();
+    defer enc.end();
+    enc.compact(blas, compacted_blas);
+}
+device.submit(&cmd2);
 ```
 
 **When to compact**: Static geometry that will be used for many frames. Not worth it for frequently rebuilt structures.

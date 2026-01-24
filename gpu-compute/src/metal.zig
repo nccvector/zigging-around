@@ -1,43 +1,59 @@
-// src/metal.zig - Idiomatic Zig wrapper for Metal compute
+// metal.zig - Idiomatic Zig wrapper for Metal
+//
+// Design principles:
+// - Less tedious than raw MTL*** APIs
+// - Full Metal flexibility preserved
+// - Scope-based encoder lifetime with defer
+// - Convenience methods without losing control
 
 const std = @import("std");
 pub const mtl = @cImport({
     @cInclude("metal_wrapper.h");
 });
 
+// =============================================================================
+// Errors
+// =============================================================================
+
 pub const Error = error{
     DeviceNotFound,
-    ShaderCompilationFailed,
-    FunctionNotFound,
-    PipelineCreationFailed,
-    BufferCreationFailed,
     CommandQueueCreationFailed,
     CommandBufferCreationFailed,
     EncoderCreationFailed,
+    LibraryCompilationFailed,
+    FunctionNotFound,
+    PipelineCreationFailed,
+    BufferCreationFailed,
+    TextureCreationFailed,
     AccelerationStructureCreationFailed,
+    SamplerCreationFailed,
+    HeapCreationFailed,
 };
 
-const MAX_QUEUES = 4;
+// =============================================================================
+// Device - Resource Creation & Submission
+// =============================================================================
 
 pub const Device = struct {
     handle: mtl.MTLDeviceRef,
-    queues: [MAX_QUEUES]mtl.MTLCommandQueueRef,
-    next_queue: usize = 0,
+    queue: mtl.MTLCommandQueueRef,
 
+    /// Create device with system default GPU
     pub fn default() Error!Device {
-        const handle = mtl.MTLWrapperCreateSystemDefaultDevice() orelse return error.DeviceNotFound;
-
-        // Pre-create queue pool
-        var queues: [MAX_QUEUES]mtl.MTLCommandQueueRef = undefined;
-        for (&queues) |*q| {
-            q.* = mtl.MTLDeviceNewCommandQueue(handle) orelse return error.CommandQueueCreationFailed;
-        }
+        const handle = mtl.MTLWrapperCreateSystemDefaultDevice() orelse
+            return error.DeviceNotFound;
+        const queue = mtl.MTLDeviceNewCommandQueue(handle) orelse
+            return error.CommandQueueCreationFailed;
 
         return .{
             .handle = handle,
-            .queues = queues,
+            .queue = queue,
         };
     }
+
+    // -------------------------------------------------------------------------
+    // Device Info
+    // -------------------------------------------------------------------------
 
     pub fn name(self: Device) ?[*:0]const u8 {
         return mtl.MTLDeviceName(self.handle);
@@ -47,70 +63,136 @@ pub const Device = struct {
         return mtl.MTLDeviceHasUnifiedMemory(self.handle);
     }
 
-    pub fn createBuffer(self: Device, comptime T: type, count: usize) Error!Buffer(T) {
-        return self.createBufferWithMode(T, count, .shared);
-    }
-
-    pub fn createBufferWithMode(self: Device, comptime T: type, count: usize, mode: StorageMode) Error!Buffer(T) {
-        const buffer_handle = mtl.MTLDeviceNewBufferWithLength(self.handle, count * @sizeOf(T), mode.toResourceOptions()) orelse return error.BufferCreationFailed;
-        return .{
-            .handle = buffer_handle,
-            .len = count,
-            .storage_mode = mode,
-        };
-    }
-
-    /// Check if device supports ray tracing
     pub fn supportsRaytracing(self: Device) bool {
         return mtl.MTLDeviceSupportsRaytracing(self.handle);
     }
 
-    /// Create a 2D texture with the specified dimensions and format
-    pub fn createTexture(self: Device, width: u64, height: u64, format: PixelFormat, usage: u32) Error!Texture {
-        const desc = mtl.MTLTextureDescriptorCreate();
-        mtl.MTLTextureDescriptorSetTextureType(desc, mtl.MTLTextureType2D);
-        mtl.MTLTextureDescriptorSetPixelFormat(desc, @intFromEnum(format));
-        mtl.MTLTextureDescriptorSetWidth(desc, width);
-        mtl.MTLTextureDescriptorSetHeight(desc, height);
-        mtl.MTLTextureDescriptorSetUsage(desc, usage);
-        mtl.MTLTextureDescriptorSetStorageMode(desc, mtl.MTLResourceStorageModeShared);
+    // -------------------------------------------------------------------------
+    // Buffer Creation
+    // -------------------------------------------------------------------------
 
-        const handle = mtl.MTLDeviceNewTextureWithDescriptor(self.handle, desc) orelse return error.BufferCreationFailed;
+    pub fn buffer(self: Device, comptime T: type, count: usize, opts: BufferOptions) Error!Buffer(T) {
+        const size = count * @sizeOf(T);
+        const resource_opts = opts.storage.toResourceOptions();
+        const handle = mtl.MTLDeviceNewBufferWithLength(self.handle, size, resource_opts) orelse
+            return error.BufferCreationFailed;
+
         return .{
             .handle = handle,
+            .len = count,
+            .storage = opts.storage,
+        };
+    }
+
+    /// Create buffer with default shared storage
+    pub fn bufferShared(self: Device, comptime T: type, count: usize) Error!Buffer(T) {
+        return self.buffer(T, count, .{});
+    }
+
+    /// Create GPU-only buffer (best performance for intermediates)
+    pub fn bufferPrivate(self: Device, comptime T: type, count: usize) Error!Buffer(T) {
+        return self.buffer(T, count, .{ .storage = .private });
+    }
+
+    // -------------------------------------------------------------------------
+    // Texture Creation
+    // -------------------------------------------------------------------------
+
+    pub fn texture(self: Device, desc: TextureDescriptor) Error!Texture {
+        const mtl_desc = mtl.MTLTextureDescriptorCreate();
+        mtl.MTLTextureDescriptorSetTextureType(mtl_desc, @intFromEnum(desc.texture_type));
+        mtl.MTLTextureDescriptorSetPixelFormat(mtl_desc, @intFromEnum(desc.pixel_format));
+        mtl.MTLTextureDescriptorSetWidth(mtl_desc, desc.width);
+        mtl.MTLTextureDescriptorSetHeight(mtl_desc, desc.height);
+        mtl.MTLTextureDescriptorSetDepth(mtl_desc, desc.depth);
+        mtl.MTLTextureDescriptorSetMipmapLevelCount(mtl_desc, desc.mipmap_levels);
+        mtl.MTLTextureDescriptorSetArrayLength(mtl_desc, desc.array_length);
+        mtl.MTLTextureDescriptorSetUsage(mtl_desc, desc.usage.toMtl());
+        mtl.MTLTextureDescriptorSetStorageMode(mtl_desc, @intFromEnum(desc.storage));
+
+        const handle = mtl.MTLDeviceNewTextureWithDescriptor(self.handle, mtl_desc) orelse
+            return error.TextureCreationFailed;
+
+        return .{
+            .handle = handle,
+            .width = desc.width,
+            .height = desc.height,
+            .depth = desc.depth,
+            .pixel_format = desc.pixel_format,
+        };
+    }
+
+    /// Convenience: create 2D texture
+    pub fn texture2d(self: Device, width: u32, height: u32, format: PixelFormat, usage: TextureUsage) Error!Texture {
+        return self.texture(.{
             .width = width,
             .height = height,
             .pixel_format = format,
-        };
+            .usage = usage,
+        });
     }
 
-    /// Create a compute pipeline from shader source and kernel name
-    /// TODO: Can implement a library cache in future. Cache based on source hash to avoid re-compilation and reusing the same library.
-    pub fn createComputePipeline(self: Device, source: [*:0]const u8, kernel_name: [*:0]const u8) Error!ComputePipeline {
-        // Compile shader to library
+    // -------------------------------------------------------------------------
+    // Pipeline Creation
+    // -------------------------------------------------------------------------
+
+    pub fn computePipeline(self: Device, desc: ComputePipelineDescriptor) Error!ComputePipeline {
+        // Compile library from source
         var compile_error: mtl.NSErrorRef = null;
-        const library = mtl.MTLDeviceNewLibraryWithSource(self.handle, source, null, &compile_error) orelse {
-            const desc: [*c]const u8 = mtl.NSErrorLocalizedDescription(compile_error) orelse "(unknown error)";
-            std.debug.print("Failed to compile shader: {s}\n", .{desc});
-            return error.ShaderCompilationFailed;
+        const library = mtl.MTLDeviceNewLibraryWithSource(
+            self.handle,
+            desc.source,
+            null,
+            &compile_error,
+        ) orelse {
+            if (compile_error) |err| {
+                const err_desc = mtl.NSErrorLocalizedDescription(err);
+                if (err_desc) |d| {
+                    std.debug.print("Shader compilation failed: {s}\n", .{d});
+                }
+            }
+            return error.LibraryCompilationFailed;
         };
 
-        // Get kernel function
-        const func = mtl.MTLLibraryNewFunctionWithName(library, kernel_name) orelse return error.FunctionNotFound;
+        // Get function
+        const func = mtl.MTLLibraryNewFunctionWithName(library, desc.function) orelse
+            return error.FunctionNotFound;
 
         // Create pipeline
         var pipeline_error: mtl.NSErrorRef = null;
-        const pipeline_handle = mtl.MTLDeviceNewComputePipelineStateWithFunction(self.handle, func, &pipeline_error) orelse {
-            const desc: [*c]const u8 = mtl.NSErrorLocalizedDescription(pipeline_error) orelse "(unknown error)";
-            std.debug.print("Failed to create pipeline: {s}\n", .{desc});
+        const handle = mtl.MTLDeviceNewComputePipelineStateWithFunction(
+            self.handle,
+            func,
+            &pipeline_error,
+        ) orelse {
+            if (pipeline_error) |err| {
+                const err_desc = mtl.NSErrorLocalizedDescription(err);
+                if (err_desc) |d| {
+                    std.debug.print("Pipeline creation failed: {s}\n", .{d});
+                }
+            }
             return error.PipelineCreationFailed;
         };
 
-        return .{ .handle = pipeline_handle };
+        return .{ .handle = handle };
     }
 
-    /// Get acceleration structure sizes for a descriptor
-    pub fn getAccelerationStructureSizes(self: Device, descriptor: anytype) AccelerationStructureSizes {
+    /// Convenience: create pipeline from source and function name
+    pub fn createPipeline(self: Device, source: [*:0]const u8, function: [*:0]const u8) Error!ComputePipeline {
+        return self.computePipeline(.{ .source = source, .function = function });
+    }
+
+    // -------------------------------------------------------------------------
+    // Acceleration Structures
+    // -------------------------------------------------------------------------
+
+    pub fn accelerationStructure(self: Device, size: u64) Error!AccelerationStructure {
+        const handle = mtl.MTLDeviceNewAccelerationStructureWithSize(self.handle, size) orelse
+            return error.AccelerationStructureCreationFailed;
+        return .{ .handle = handle };
+    }
+
+    pub fn accelSizes(self: Device, descriptor: anytype) AccelSizes {
         const desc_handle = if (@hasField(@TypeOf(descriptor), "handle")) descriptor.handle else descriptor;
         const sizes = mtl.MTLDeviceGetAccelerationStructureSizes(self.handle, desc_handle);
         return .{
@@ -120,389 +202,614 @@ pub const Device = struct {
         };
     }
 
-    /// Create an acceleration structure with a specific size
-    pub fn createAccelerationStructure(self: Device, size: u64) Error!AccelerationStructure {
-        const handle = mtl.MTLDeviceNewAccelerationStructureWithSize(self.handle, size) orelse return error.AccelerationStructureCreationFailed;
-        return .{ .handle = handle };
+    // -------------------------------------------------------------------------
+    // Events
+    // -------------------------------------------------------------------------
+
+    pub fn event(self: Device) Event {
+        return .{ .handle = mtl.MTLDeviceNewEvent(self.handle) };
     }
 
-    /// Create an acceleration structure from a descriptor (gets size automatically)
-    pub fn createAccelerationStructureWithDescriptor(self: Device, descriptor: anytype) Error!AccelerationStructure {
-        const desc_handle = if (@hasField(@TypeOf(descriptor), "handle")) descriptor.handle else descriptor;
-        const handle = mtl.MTLDeviceNewAccelerationStructureWithDescriptor(self.handle, desc_handle) orelse return error.AccelerationStructureCreationFailed;
-        return .{ .handle = handle };
+    pub fn sharedEvent(self: Device) SharedEvent {
+        return .{ .handle = mtl.MTLDeviceNewSharedEvent(self.handle) };
     }
 
-    /// Get next queue from pool (round-robin)
-    fn nextQueue(self: *Device) mtl.MTLCommandQueueRef {
-        const queue = self.queues[self.next_queue];
-        self.next_queue = (self.next_queue + 1) % MAX_QUEUES;
-        return queue;
+    // -------------------------------------------------------------------------
+    // Command Buffer Creation
+    // -------------------------------------------------------------------------
+
+    pub fn commandBuffer(self: Device) Error!CommandBuffer {
+        const handle = mtl.MTLCommandQueueCommandBuffer(self.queue) orelse
+            return error.CommandBufferCreationFailed;
+        return .{
+            .handle = handle,
+            .current_encoder = null,
+        };
     }
 
-    /// Submit a command, wait for completion
-    pub fn submit(self: *Device, command: anytype) void {
-        const queue = self.nextQueue();
-        const cmd_buf = command.finalize(queue);
-        mtl.MTLCommandBufferWaitUntilCompleted(cmd_buf);
+    /// Alias for commandBuffer()
+    pub fn command(self: Device) Error!CommandBuffer {
+        return self.commandBuffer();
     }
 
-    /// Submit a command, return fence for async waiting
-    pub fn submitAsync(self: *Device, command: anytype) Fence {
-        const queue = self.nextQueue();
-        const cmd_buf = command.finalize(queue);
-        return Fence{ .command_buffer = cmd_buf };
+    // -------------------------------------------------------------------------
+    // Submission
+    // -------------------------------------------------------------------------
+
+    /// Submit and wait for completion
+    pub fn submit(self: Device, cmd: *CommandBuffer) void {
+        _ = self;
+        cmd.endCurrentEncoder();
+        mtl.MTLCommandBufferCommit(cmd.handle);
+        mtl.MTLCommandBufferWaitUntilCompleted(cmd.handle);
+    }
+
+    /// Submit and return fence for async waiting
+    pub fn submitAsync(self: Device, cmd: *CommandBuffer) Fence {
+        _ = self;
+        cmd.endCurrentEncoder();
+        mtl.MTLCommandBufferCommit(cmd.handle);
+        return .{ .command_buffer = cmd.handle };
     }
 };
+
+// =============================================================================
+// CommandBuffer - The Orchestrator
+// =============================================================================
+
+pub const CommandBuffer = struct {
+    handle: mtl.MTLCommandBufferRef,
+    current_encoder: ?EncoderHandle,
+
+    const EncoderHandle = union(enum) {
+        compute: mtl.MTLComputeCommandEncoderRef,
+        blit: mtl.MTLBlitCommandEncoderRef,
+        accel: mtl.MTLAccelerationStructureCommandEncoderRef,
+        // render: mtl.MTLRenderCommandEncoderRef, // TODO
+    };
+
+    /// End any active encoder
+    fn endCurrentEncoder(self: *CommandBuffer) void {
+        if (self.current_encoder) |enc| {
+            switch (enc) {
+                .compute => |e| mtl.MTLComputeCommandEncoderEndEncoding(e),
+                .blit => |e| mtl.MTLBlitCommandEncoderEndEncoding(e),
+                .accel => |e| mtl.MTLAccelerationStructureCommandEncoderEndEncoding(e),
+            }
+            self.current_encoder = null;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Encoder Creation
+    // -------------------------------------------------------------------------
+
+    pub fn computeEncoder(self: *CommandBuffer, pipeline: ComputePipeline, opts: ComputeEncoderOptions) ComputeEncoder {
+        self.endCurrentEncoder();
+
+        const enc = if (opts.concurrent)
+            mtl.MTLCommandBufferComputeCommandEncoderWithDispatchType(self.handle, mtl.MTLDispatchTypeConcurrent)
+        else
+            mtl.MTLCommandBufferComputeCommandEncoder(self.handle);
+
+        self.current_encoder = .{ .compute = enc };
+
+        // Set initial pipeline
+        mtl.MTLComputeCommandEncoderSetComputePipelineState(enc, pipeline.handle);
+
+        return .{
+            .handle = enc,
+            .cmd = self,
+            .current_pipeline = pipeline,
+        };
+    }
+
+    pub fn blitEncoder(self: *CommandBuffer) BlitEncoder {
+        self.endCurrentEncoder();
+
+        const enc = mtl.MTLCommandBufferBlitCommandEncoder(self.handle);
+        self.current_encoder = .{ .blit = enc };
+
+        return .{
+            .handle = enc,
+            .cmd = self,
+        };
+    }
+
+    pub fn accelEncoder(self: *CommandBuffer) AccelEncoder {
+        self.endCurrentEncoder();
+
+        const enc = mtl.MTLCommandBufferAccelerationStructureCommandEncoder(self.handle);
+        self.current_encoder = .{ .accel = enc };
+
+        return .{
+            .handle = enc,
+            .cmd = self,
+        };
+    }
+
+    // -------------------------------------------------------------------------
+    // Event Signaling (GPU-GPU sync across command buffers)
+    // -------------------------------------------------------------------------
+
+    pub fn signal(self: *CommandBuffer, evt: Event, value: u64) void {
+        mtl.MTLCommandBufferEncodeSignalEvent(self.handle, evt.handle, value);
+    }
+
+    pub fn wait(self: *CommandBuffer, evt: Event, value: u64) void {
+        mtl.MTLCommandBufferEncodeWaitForEvent(self.handle, evt.handle, value);
+    }
+};
+
+pub const ComputeEncoderOptions = struct {
+    concurrent: bool = false,
+};
+
+// =============================================================================
+// ComputeEncoder
+// =============================================================================
+
+pub const ComputeEncoder = struct {
+    handle: mtl.MTLComputeCommandEncoderRef,
+    cmd: *CommandBuffer,
+    current_pipeline: ComputePipeline,
+
+    // -------------------------------------------------------------------------
+    // Pipeline
+    // -------------------------------------------------------------------------
+
+    /// Switch pipeline (cheap within same encoder!)
+    pub fn pipeline(self: *ComputeEncoder, p: ComputePipeline) void {
+        mtl.MTLComputeCommandEncoderSetComputePipelineState(self.handle, p.handle);
+        self.current_pipeline = p;
+    }
+
+    // -------------------------------------------------------------------------
+    // Buffer Binding
+    // -------------------------------------------------------------------------
+
+    /// Bind single buffer at index
+    pub fn buffer(self: *ComputeEncoder, buf: anytype, index: u32) void {
+        self.bufferOffset(buf, index, 0);
+    }
+
+    /// Bind single buffer at index with offset
+    pub fn bufferOffset(self: *ComputeEncoder, buf: anytype, index: u32, offset: usize) void {
+        const handle = getHandle(buf);
+        mtl.MTLComputeCommandEncoderSetBuffer(self.handle, handle, offset, index);
+    }
+
+    /// Bind multiple buffers starting at index 0
+    pub fn buffers(self: *ComputeEncoder, bufs: anytype) void {
+        const info = @typeInfo(@TypeOf(bufs));
+        if (info == .@"struct" and info.@"struct".is_tuple) {
+            inline for (bufs, 0..) |b, i| {
+                self.buffer(b, @intCast(i));
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Texture Binding
+    // -------------------------------------------------------------------------
+
+    pub fn texture(self: *ComputeEncoder, tex: Texture, index: u32) void {
+        mtl.MTLComputeCommandEncoderSetTexture(self.handle, tex.handle, index);
+    }
+
+    pub fn textures(self: *ComputeEncoder, texs: anytype) void {
+        const info = @typeInfo(@TypeOf(texs));
+        if (info == .@"struct" and info.@"struct".is_tuple) {
+            inline for (texs, 0..) |t, i| {
+                self.texture(t, @intCast(i));
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Bytes (Inline Uniform Data)
+    // -------------------------------------------------------------------------
+
+    pub fn bytes(self: *ComputeEncoder, data: anytype, index: u32) void {
+        const T = @TypeOf(data);
+        if (@typeInfo(T) == .pointer) {
+            const Child = std.meta.Child(T);
+            mtl.MTLComputeCommandEncoderSetBytes(self.handle, @ptrCast(data), @sizeOf(Child), index);
+        } else {
+            mtl.MTLComputeCommandEncoderSetBytes(self.handle, @ptrCast(&data), @sizeOf(T), index);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Acceleration Structure Binding (for ray tracing)
+    // -------------------------------------------------------------------------
+
+    pub fn accel(self: *ComputeEncoder, as: AccelerationStructure, index: u32) void {
+        mtl.MTLComputeCommandEncoderSetAccelerationStructure(self.handle, as.handle, index);
+    }
+
+    // -------------------------------------------------------------------------
+    // Threadgroup Memory
+    // -------------------------------------------------------------------------
+
+    pub fn threadgroupMemory(self: *ComputeEncoder, length: usize, index: u32) void {
+        mtl.MTLComputeCommandEncoderSetThreadgroupMemoryLength(self.handle, length, index);
+    }
+
+    // -------------------------------------------------------------------------
+    // Dispatch
+    // -------------------------------------------------------------------------
+
+    /// Full control dispatch
+    pub fn dispatch(self: *ComputeEncoder, groups: Size, threads_per_group: Size) void {
+        mtl.MTLComputeCommandEncoderDispatchThreadgroups(
+            self.handle,
+            groups.toMtl(),
+            threads_per_group.toMtl(),
+        );
+    }
+
+    /// 1D dispatch - auto-calculates threadgroups based on pipeline
+    pub fn dispatch1d(self: *ComputeEncoder, count: usize) void {
+        const max_threads = self.current_pipeline.maxThreadsPerThreadgroup();
+        const threads: usize = @min(max_threads, 1024);
+        const groups = (count + threads - 1) / threads;
+        self.dispatch(
+            .{ .width = groups },
+            .{ .width = threads },
+        );
+    }
+
+    /// 2D dispatch - uses 16x16 threadgroups
+    pub fn dispatch2d(self: *ComputeEncoder, width: usize, height: usize) void {
+        const groups_x = (width + 15) / 16;
+        const groups_y = (height + 15) / 16;
+        self.dispatch(
+            .{ .width = groups_x, .height = groups_y },
+            .{ .width = 16, .height = 16 },
+        );
+    }
+
+    /// 3D dispatch
+    pub fn dispatch3d(self: *ComputeEncoder, width: usize, height: usize, depth: usize) void {
+        const groups_x = (width + 7) / 8;
+        const groups_y = (height + 7) / 8;
+        const groups_z = (depth + 7) / 8;
+        self.dispatch(
+            .{ .width = groups_x, .height = groups_y, .depth = groups_z },
+            .{ .width = 8, .height = 8, .depth = 8 },
+        );
+    }
+
+    /// Indirect dispatch - GPU-driven workloads
+    pub fn dispatchIndirect(self: *ComputeEncoder, buf: anytype, offset: usize) void {
+        const handle = getHandle(buf);
+        const threads = self.current_pipeline.maxThreadsPerThreadgroup();
+        mtl.MTLComputeCommandEncoderDispatchThreadgroupsWithIndirectBuffer(
+            self.handle,
+            handle,
+            offset,
+            mtl.MTLSize{ .width = threads, .height = 1, .depth = 1 },
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Synchronization
+    // -------------------------------------------------------------------------
+
+    /// Memory barrier (for concurrent dispatch mode)
+    pub fn barrier(self: *ComputeEncoder, scope: BarrierScope) void {
+        mtl.MTLComputeCommandEncoderMemoryBarrierWithScope(self.handle, @intFromEnum(scope));
+    }
+
+    // -------------------------------------------------------------------------
+    // Lifecycle
+    // -------------------------------------------------------------------------
+
+    /// End encoding - usually called via defer
+    pub fn end(self: *ComputeEncoder) void {
+        if (self.cmd.current_encoder) |enc| {
+            if (enc == .compute and enc.compute == self.handle) {
+                mtl.MTLComputeCommandEncoderEndEncoding(self.handle);
+                self.cmd.current_encoder = null;
+            }
+        }
+    }
+};
+
+// =============================================================================
+// BlitEncoder
+// =============================================================================
+
+pub const BlitEncoder = struct {
+    handle: mtl.MTLBlitCommandEncoderRef,
+    cmd: *CommandBuffer,
+
+    // -------------------------------------------------------------------------
+    // Buffer Copy
+    // -------------------------------------------------------------------------
+
+    /// Copy entire buffer
+    pub fn copy(self: *BlitEncoder, src: anytype, dst: anytype) void {
+        const src_handle = getHandle(src);
+        const dst_handle = getHandle(dst);
+        const size = getByteSize(src);
+        mtl.MTLBlitCommandEncoderCopyFromBuffer(self.handle, src_handle, 0, dst_handle, 0, size);
+    }
+
+    /// Copy buffer region
+    pub fn copyRegion(self: *BlitEncoder, src: anytype, src_offset: usize, dst: anytype, dst_offset: usize, size: usize) void {
+        const src_handle = getHandle(src);
+        const dst_handle = getHandle(dst);
+        mtl.MTLBlitCommandEncoderCopyFromBuffer(self.handle, src_handle, src_offset, dst_handle, dst_offset, size);
+    }
+
+    // -------------------------------------------------------------------------
+    // Buffer Fill
+    // -------------------------------------------------------------------------
+
+    /// Fill entire buffer with value
+    pub fn fill(self: *BlitEncoder, buf: anytype, value: u8) void {
+        const handle = getHandle(buf);
+        const size = getByteSize(buf);
+        mtl.MTLBlitCommandEncoderFillBuffer(self.handle, handle, 0, size, value);
+    }
+
+    /// Fill buffer region
+    pub fn fillRegion(self: *BlitEncoder, buf: anytype, offset: usize, size: usize, value: u8) void {
+        const handle = getHandle(buf);
+        mtl.MTLBlitCommandEncoderFillBuffer(self.handle, handle, offset, size, value);
+    }
+
+    // -------------------------------------------------------------------------
+    // Texture Operations
+    // -------------------------------------------------------------------------
+
+    pub fn copyTexture(self: *BlitEncoder, src: Texture, dst: Texture) void {
+        mtl.MTLBlitCommandEncoderCopyFromTexture(self.handle, src.handle, dst.handle);
+    }
+
+    pub fn generateMipmaps(self: *BlitEncoder, tex: Texture) void {
+        mtl.MTLBlitCommandEncoderGenerateMipmaps(self.handle, tex.handle);
+    }
+
+    // -------------------------------------------------------------------------
+    // Synchronization
+    // -------------------------------------------------------------------------
+
+    /// Synchronize managed buffer (macOS)
+    pub fn synchronize(self: *BlitEncoder, resource: anytype) void {
+        const handle = getHandle(resource);
+        mtl.MTLBlitCommandEncoderSynchronizeResource(self.handle, handle);
+    }
+
+    // -------------------------------------------------------------------------
+    // Lifecycle
+    // -------------------------------------------------------------------------
+
+    pub fn end(self: *BlitEncoder) void {
+        if (self.cmd.current_encoder) |enc| {
+            if (enc == .blit and enc.blit == self.handle) {
+                mtl.MTLBlitCommandEncoderEndEncoding(self.handle);
+                self.cmd.current_encoder = null;
+            }
+        }
+    }
+};
+
+// =============================================================================
+// AccelEncoder
+// =============================================================================
+
+pub const AccelEncoder = struct {
+    handle: mtl.MTLAccelerationStructureCommandEncoderRef,
+    cmd: *CommandBuffer,
+
+    // -------------------------------------------------------------------------
+    // Build
+    // -------------------------------------------------------------------------
+
+    pub fn build(
+        self: *AccelEncoder,
+        accel_struct: AccelerationStructure,
+        descriptor: anytype,
+        scratch: anytype,
+    ) void {
+        self.buildOffset(accel_struct, descriptor, scratch, 0);
+    }
+
+    pub fn buildOffset(
+        self: *AccelEncoder,
+        accel_struct: AccelerationStructure,
+        descriptor: anytype,
+        scratch: anytype,
+        scratch_offset: usize,
+    ) void {
+        const desc_handle = if (@hasField(@TypeOf(descriptor), "handle")) descriptor.handle else descriptor;
+        const scratch_handle = getHandle(scratch);
+        mtl.MTLAccelerationStructureCommandEncoderBuildAccelerationStructure(
+            self.handle,
+            accel_struct.handle,
+            desc_handle,
+            scratch_handle,
+            scratch_offset,
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Refit
+    // -------------------------------------------------------------------------
+
+    pub fn refit(
+        self: *AccelEncoder,
+        src: AccelerationStructure,
+        descriptor: anytype,
+        dst: AccelerationStructure,
+        scratch: anytype,
+    ) void {
+        self.refitOffset(src, descriptor, dst, scratch, 0);
+    }
+
+    pub fn refitOffset(
+        self: *AccelEncoder,
+        src: AccelerationStructure,
+        descriptor: anytype,
+        dst: AccelerationStructure,
+        scratch: anytype,
+        scratch_offset: usize,
+    ) void {
+        const desc_handle = if (@hasField(@TypeOf(descriptor), "handle")) descriptor.handle else descriptor;
+        const scratch_handle = getHandle(scratch);
+        mtl.MTLAccelerationStructureCommandEncoderRefitAccelerationStructure(
+            self.handle,
+            src.handle,
+            desc_handle,
+            dst.handle,
+            scratch_handle,
+            scratch_offset,
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Copy
+    // -------------------------------------------------------------------------
+
+    pub fn copy(self: *AccelEncoder, src: AccelerationStructure, dst: AccelerationStructure) void {
+        mtl.MTLAccelerationStructureCommandEncoderCopyAccelerationStructure(self.handle, src.handle, dst.handle);
+    }
+
+    pub fn compact(self: *AccelEncoder, src: AccelerationStructure, dst: AccelerationStructure) void {
+        mtl.MTLAccelerationStructureCommandEncoderCopyAndCompactAccelerationStructure(self.handle, src.handle, dst.handle);
+    }
+
+    // -------------------------------------------------------------------------
+    // Queries
+    // -------------------------------------------------------------------------
+
+    pub fn writeCompactedSize(self: *AccelEncoder, accel_struct: AccelerationStructure, buf: anytype, offset: usize) void {
+        const handle = getHandle(buf);
+        mtl.MTLAccelerationStructureCommandEncoderWriteCompactedAccelerationStructureSize(
+            self.handle,
+            accel_struct.handle,
+            handle,
+            offset,
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Synchronization
+    // -------------------------------------------------------------------------
+
+    pub fn barrier(self: *AccelEncoder) void {
+        // Note: Metal uses memoryBarrier for accel encoders
+        // This ensures all previous builds complete before subsequent operations
+        _ = self;
+        // MTLAccelerationStructureCommandEncoder doesn't have explicit barrier,
+        // but operations within it are serialized. Barrier is implicit between
+        // accel encoder and next encoder.
+    }
+
+    // -------------------------------------------------------------------------
+    // Lifecycle
+    // -------------------------------------------------------------------------
+
+    pub fn end(self: *AccelEncoder) void {
+        if (self.cmd.current_encoder) |enc| {
+            if (enc == .accel and enc.accel == self.handle) {
+                mtl.MTLAccelerationStructureCommandEncoderEndEncoding(self.handle);
+                self.cmd.current_encoder = null;
+            }
+        }
+    }
+};
+
+// =============================================================================
+// Resource Types
+// =============================================================================
 
 pub fn Buffer(comptime T: type) type {
     return struct {
         handle: mtl.MTLBufferRef,
         len: usize,
-        storage_mode: StorageMode = .shared,
+        storage: StorageMode,
 
         const Self = @This();
 
-        /// Get a slice to the buffer contents (CPU-accessible for shared/managed storage)
-        /// Returns null for private storage mode (GPU-only).
+        /// Get CPU-accessible slice (null for private storage)
         pub fn contents(self: Self) ?[]T {
-            if (self.storage_mode == .private) return null;
+            if (self.storage == .private) return null;
             const ptr: [*]T = @ptrCast(@alignCast(mtl.MTLBufferContents(self.handle)));
             return ptr[0..self.len];
         }
 
-        /// Get the buffer size in bytes (useful for blit operations)
-        pub fn byteSize(self: Self) u64 {
+        /// Byte size of buffer
+        pub fn byteSize(self: Self) usize {
             return self.len * @sizeOf(T);
         }
 
-        /// For managed storage: notify GPU that CPU modified a range.
-        /// Call after writing to contents() on macOS with managed mode.
+        /// For managed storage: notify GPU of CPU writes
         pub fn didModifyRange(self: Self, offset: usize, length: usize) void {
-            if (self.storage_mode == .managed) {
+            if (self.storage == .managed) {
                 mtl.MTLBufferDidModifyRange(self.handle, offset * @sizeOf(T), length * @sizeOf(T));
             }
         }
     };
 }
 
-pub const ComputePipeline = struct {
-    handle: mtl.MTLComputePipelineStateRef,
-
-    /// Get max threads per threadgroup for this pipeline
-    pub fn maxThreadsPerThreadGroup(self: ComputePipeline) u64 {
-        return mtl.MTLComputePipelineStateMaxTotalThreadsPerThreadgroup(self.handle);
-    }
-
-    /// Calculate optimal grid and threadgroup size for 1D dispatch
-    /// Returns .{ grid, threads_per_group }
-    pub fn gridFor1d(self: ComputePipeline, element_count: usize) struct { Size, Size } {
-        const threads_per_group = self.maxThreadsPerThreadGroup();
-        const num_groups = (element_count + threads_per_group - 1) / threads_per_group;
-        return .{
-            Size{ .width = num_groups },
-            Size{ .width = threads_per_group },
-        };
-    }
-};
-
-pub const Size = struct {
-    width: u64,
-    height: u64 = 1,
-    depth: u64 = 1,
-
-    pub fn init1d(width: u64) Size {
-        return .{
-            .width = width,
-        };
-    }
-};
-
-// =============================================================================
-// Acceleration Structures (Ray Tracing)
-// =============================================================================
-
-/// Sizes needed to allocate acceleration structures and scratch buffers
-pub const AccelerationStructureSizes = struct {
-    acceleration_structure_size: u64,
-    build_scratch_buffer_size: u64,
-    refit_scratch_buffer_size: u64,
-};
-
-/// Built acceleration structure (can be BLAS or TLAS)
-pub const AccelerationStructure = struct {
-    handle: mtl.MTLAccelerationStructureRef,
-
-    pub fn size(self: AccelerationStructure) u64 {
-        return mtl.MTLAccelerationStructureSize(self.handle);
-    }
-};
-
-/// Triangle geometry descriptor for building BLAS
-pub const TriangleGeometryDescriptor = struct {
-    handle: mtl.MTLAccelerationStructureTriangleGeometryDescriptorRef,
-
-    pub fn init() TriangleGeometryDescriptor {
-        return .{
-            .handle = mtl.MTLAccelerationStructureTriangleGeometryDescriptorCreate(),
-        };
-    }
-
-    pub fn setVertexBuffer(self: TriangleGeometryDescriptor, buffer: anytype, opts: struct { offset: u64 = 0, stride: u64 = 12 }) TriangleGeometryDescriptor {
-        const buf_handle = if (@hasField(@TypeOf(buffer), "handle")) buffer.handle else buffer;
-        mtl.MTLAccelerationStructureTriangleGeometryDescriptorSetVertexBuffer(self.handle, buf_handle);
-        mtl.MTLAccelerationStructureTriangleGeometryDescriptorSetVertexBufferOffset(self.handle, opts.offset);
-        mtl.MTLAccelerationStructureTriangleGeometryDescriptorSetVertexStride(self.handle, opts.stride);
-        return self;
-    }
-
-    pub fn setIndexBuffer(self: TriangleGeometryDescriptor, buffer: anytype, index_type: IndexType, opts: struct { offset: u64 = 0 }) TriangleGeometryDescriptor {
-        const buf_handle = if (@hasField(@TypeOf(buffer), "handle")) buffer.handle else buffer;
-        mtl.MTLAccelerationStructureTriangleGeometryDescriptorSetIndexBuffer(self.handle, buf_handle);
-        mtl.MTLAccelerationStructureTriangleGeometryDescriptorSetIndexBufferOffset(self.handle, opts.offset);
-        mtl.MTLAccelerationStructureTriangleGeometryDescriptorSetIndexType(self.handle, @intFromEnum(index_type));
-        return self;
-    }
-
-    pub fn setTriangleCount(self: TriangleGeometryDescriptor, count: u64) TriangleGeometryDescriptor {
-        mtl.MTLAccelerationStructureTriangleGeometryDescriptorSetTriangleCount(self.handle, count);
-        return self;
-    }
-};
-
-/// Bounding box geometry descriptor for custom primitives (spheres, etc.)
-pub const BoundingBoxGeometryDescriptor = struct {
-    handle: mtl.MTLAccelerationStructureBoundingBoxGeometryDescriptorRef,
-
-    pub fn init() BoundingBoxGeometryDescriptor {
-        return .{
-            .handle = mtl.MTLAccelerationStructureBoundingBoxGeometryDescriptorCreate(),
-        };
-    }
-
-    pub fn setBoundingBoxBuffer(self: BoundingBoxGeometryDescriptor, buffer: anytype, opts: struct { offset: u64 = 0, stride: u64 = 24 }) BoundingBoxGeometryDescriptor {
-        const buf_handle = if (@hasField(@TypeOf(buffer), "handle")) buffer.handle else buffer;
-        mtl.MTLAccelerationStructureBoundingBoxGeometryDescriptorSetBoundingBoxBuffer(self.handle, buf_handle);
-        mtl.MTLAccelerationStructureBoundingBoxGeometryDescriptorSetBoundingBoxBufferOffset(self.handle, opts.offset);
-        mtl.MTLAccelerationStructureBoundingBoxGeometryDescriptorSetBoundingBoxStride(self.handle, opts.stride);
-        return self;
-    }
-
-    pub fn setBoundingBoxCount(self: BoundingBoxGeometryDescriptor, count: u64) BoundingBoxGeometryDescriptor {
-        mtl.MTLAccelerationStructureBoundingBoxGeometryDescriptorSetBoundingBoxCount(self.handle, count);
-        return self;
-    }
-};
-
-/// Primitive acceleration structure descriptor (BLAS - Bottom Level)
-pub const PrimitiveAccelerationStructureDescriptor = struct {
-    handle: mtl.MTLPrimitiveAccelerationStructureDescriptorRef,
-    geometry_handles: [MAX_GEOMETRIES]*anyopaque = undefined,
-    geometry_count: usize = 0,
-
-    const MAX_GEOMETRIES = 16;
-
-    pub fn init() PrimitiveAccelerationStructureDescriptor {
-        return .{
-            .handle = mtl.MTLPrimitiveAccelerationStructureDescriptorCreate(),
-        };
-    }
-
-    /// Add a geometry descriptor (triangle or bounding box)
-    pub fn addGeometry(self: *PrimitiveAccelerationStructureDescriptor, geometry: anytype) void {
-        if (self.geometry_count < MAX_GEOMETRIES) {
-            const geo_handle = if (@hasField(@TypeOf(geometry), "handle")) geometry.handle else geometry;
-            self.geometry_handles[self.geometry_count] = geo_handle.?;
-            self.geometry_count += 1;
-        }
-    }
-
-    /// Finalize the descriptor (call after adding all geometries)
-    pub fn build(self: *PrimitiveAccelerationStructureDescriptor) void {
-        if (self.geometry_count > 0) {
-            mtl.MTLPrimitiveAccelerationStructureDescriptorSetGeometryDescriptors(
-                self.handle,
-                @ptrCast(&self.geometry_handles),
-                self.geometry_count,
-            );
-        }
-    }
-};
-
-/// Instance acceleration structure descriptor (TLAS - Top Level)
-pub const InstanceAccelerationStructureDescriptor = struct {
-    handle: mtl.MTLInstanceAccelerationStructureDescriptorRef,
-    blas_handles: [MAX_INSTANCES]mtl.MTLAccelerationStructureRef = undefined,
-    blas_count: usize = 0,
-
-    const MAX_INSTANCES = 64;
-
-    pub fn init() InstanceAccelerationStructureDescriptor {
-        return .{
-            .handle = mtl.MTLInstanceAccelerationStructureDescriptorCreate(),
-        };
-    }
-
-    /// Set the instance descriptor buffer (contains MTLAccelerationStructureInstanceDescriptor structs)
-    pub fn setInstanceDescriptorBuffer(self: InstanceAccelerationStructureDescriptor, buffer: anytype, opts: struct { offset: u64 = 0, stride: u64 = 64 }) InstanceAccelerationStructureDescriptor {
-        const buf_handle = if (@hasField(@TypeOf(buffer), "handle")) buffer.handle else buffer;
-        mtl.MTLInstanceAccelerationStructureDescriptorSetInstanceDescriptorBuffer(self.handle, buf_handle);
-        mtl.MTLInstanceAccelerationStructureDescriptorSetInstanceDescriptorBufferOffset(self.handle, opts.offset);
-        mtl.MTLInstanceAccelerationStructureDescriptorSetInstanceDescriptorStride(self.handle, opts.stride);
-        return self;
-    }
-
-    pub fn setInstanceCount(self: InstanceAccelerationStructureDescriptor, count: u64) InstanceAccelerationStructureDescriptor {
-        mtl.MTLInstanceAccelerationStructureDescriptorSetInstanceCount(self.handle, count);
-        return self;
-    }
-
-    /// Add a BLAS that instances can reference
-    pub fn addInstancedAccelerationStructure(self: *InstanceAccelerationStructureDescriptor, accel_struct: AccelerationStructure) void {
-        if (self.blas_count < MAX_INSTANCES) {
-            self.blas_handles[self.blas_count] = accel_struct.handle;
-            self.blas_count += 1;
-        }
-    }
-
-    /// Finalize the descriptor (call after adding all BLAS references)
-    pub fn build(self: *InstanceAccelerationStructureDescriptor) void {
-        if (self.blas_count > 0) {
-            mtl.MTLInstanceAccelerationStructureDescriptorSetInstancedAccelerationStructures(
-                self.handle,
-                @ptrCast(&self.blas_handles),
-                self.blas_count,
-            );
-        }
-    }
-};
-
-pub const IndexType = enum(u32) {
-    uint16 = 0,
-    uint32 = 1,
-};
-
-/// Scope for memory barriers - what resources to synchronize
-pub const BarrierScope = enum(u32) {
-    buffers = 1,
-    textures = 2,
-    render_targets = 4,
-
-    pub fn all() u32 {
-        return 1 | 2; // buffers | textures (render_targets not used in compute)
-    }
-};
-
-/// Storage mode for buffers
-pub const StorageMode = enum(u64) {
-    /// CPU and GPU can both access. Default for Apple Silicon.
-    shared = 0,
-    /// macOS only: CPU/GPU access with explicit sync. Use didModifyRange().
-    managed = 1,
-    /// GPU only. Best performance for scratch/intermediate data.
-    private = 2,
-
-    fn toResourceOptions(self: StorageMode) u64 {
-        return @intFromEnum(self) << 4; // MTLResourceStorageModeShift = 4
-    }
-};
-
-// =============================================================================
-// Textures
-// =============================================================================
-
-pub const PixelFormat = enum(u32) {
-    rgba8unorm = 70,
-    rgba8unorm_srgb = 71,
-    rgba8snorm = 72,
-    rgba8uint = 73,
-    rgba8sint = 74,
-    bgra8unorm = 80,
-    bgra8unorm_srgb = 81,
-    rgba16float = 115,
-    rgba32float = 125,
-    r8unorm = 10,
-    r16float = 25,
-    r32float = 55,
-    rg8unorm = 30,
-    rg16float = 65,
-    rg32float = 105,
-};
-
-pub const TextureUsage = struct {
-    pub const read: u32 = 1;
-    pub const write: u32 = 2;
-    pub const read_write: u32 = 3;
-};
-
 pub const Texture = struct {
     handle: mtl.MTLTextureRef,
-    width: u64,
-    height: u64,
+    width: u32,
+    height: u32,
+    depth: u32 = 1,
     pixel_format: PixelFormat,
 
-    /// Replace a region of the texture with pixel data.
-    /// For 2D textures: region is { x, y, width, height }, slice = 0.
-    /// Data should be tightly packed RGBA bytes (for rgba8unorm).
-    pub fn replaceRegion(self: Texture, data: []const u8, region: struct {
-        x: u64 = 0,
-        y: u64 = 0,
-        width: u64,
-        height: u64,
-    }) void {
-        const bytes_per_pixel = self.bytesPerPixel();
-        const bytes_per_row = region.width * bytes_per_pixel;
+    /// Upload data to entire texture
+    pub fn upload(self: Texture, data: []const u8) void {
+        self.replaceRegion(data, .{ .width = self.width, .height = self.height });
+    }
+
+    /// Download entire texture
+    pub fn download(self: Texture, data: []u8) void {
+        self.getBytes(data, .{ .width = self.width, .height = self.height });
+    }
+
+    pub fn replaceRegion(self: Texture, data: []const u8, region: Region) void {
+        const bpp = self.bytesPerPixel();
+        const bytes_per_row = region.width * bpp;
 
         mtl.MTLTextureReplaceRegion(
             self.handle,
-            mtl.MTLRegion{
+            .{
                 .origin = .{ .x = region.x, .y = region.y, .z = 0 },
                 .size = .{ .width = region.width, .height = region.height, .depth = 1 },
             },
-            0, // mip level
-            0, // slice
+            0,
+            0,
             data.ptr,
             bytes_per_row,
-            0, // bytes per image (for 3D textures)
+            0,
         );
     }
 
-    /// Read pixels back from texture into a buffer.
-    /// Buffer must be large enough: width * height * bytesPerPixel()
-    pub fn getBytes(self: Texture, data: []u8, region: struct {
-        x: u64 = 0,
-        y: u64 = 0,
-        width: u64,
-        height: u64,
-    }) void {
-        const bytes_per_pixel = self.bytesPerPixel();
-        const bytes_per_row = region.width * bytes_per_pixel;
+    pub fn getBytes(self: Texture, data: []u8, region: Region) void {
+        const bpp = self.bytesPerPixel();
+        const bytes_per_row = region.width * bpp;
 
         mtl.MTLTextureGetBytes(
             self.handle,
             data.ptr,
             bytes_per_row,
-            0, // bytes per image
-            mtl.MTLRegion{
+            0,
+            .{
                 .origin = .{ .x = region.x, .y = region.y, .z = 0 },
                 .size = .{ .width = region.width, .height = region.height, .depth = 1 },
             },
-            0, // mip level
-            0, // slice
+            0,
+            0,
         );
     }
 
-    /// Convenience: replace entire texture
-    pub fn upload(self: Texture, data: []const u8) void {
-        self.replaceRegion(data, .{ .width = self.width, .height = self.height });
-    }
-
-    /// Convenience: read entire texture
-    pub fn download(self: Texture, data: []u8) void {
-        self.getBytes(data, .{ .width = self.width, .height = self.height });
-    }
-
-    fn bytesPerPixel(self: Texture) u64 {
+    fn bytesPerPixel(self: Texture) u32 {
         return switch (self.pixel_format) {
             .r8unorm => 1,
             .rg8unorm => 2,
@@ -516,468 +823,331 @@ pub const Texture = struct {
         };
     }
 
-    /// Save texture as PPM image file (for debugging/visualization)
-    /// Assumes RGBA8 format, ignores alpha channel
-    pub fn savePPM(self: Texture, path: []const u8, pixels: []const u8) !void {
-        const file = try std.fs.cwd().createFile(path, .{});
-        defer file.close();
+    pub const Region = struct {
+        x: u32 = 0,
+        y: u32 = 0,
+        width: u32,
+        height: u32,
+    };
+};
 
-        // PPM header: P6 format (binary RGB)
-        var header_buf: [64]u8 = undefined;
-        const header = std.fmt.bufPrint(&header_buf, "P6\n{d} {d}\n255\n", .{ self.width, self.height }) catch unreachable;
-        try file.writeAll(header);
+pub const ComputePipeline = struct {
+    handle: mtl.MTLComputePipelineStateRef,
 
-        // Write RGB pixels (skip alpha)
-        var i: usize = 0;
-        while (i < pixels.len) : (i += 4) {
-            try file.writeAll(pixels[i..][0..3]); // R, G, B only
-        }
+    pub fn maxThreadsPerThreadgroup(self: ComputePipeline) usize {
+        return mtl.MTLComputePipelineStateMaxTotalThreadsPerThreadgroup(self.handle);
+    }
+};
+
+pub const AccelerationStructure = struct {
+    handle: mtl.MTLAccelerationStructureRef,
+
+    pub fn size(self: AccelerationStructure) u64 {
+        return mtl.MTLAccelerationStructureSize(self.handle);
     }
 };
 
 // =============================================================================
-// Comptime Command Builder API
+// Synchronization Primitives
 // =============================================================================
 
-const EncoderKind = enum { compute, blit, accel };
-
-// Data types - the type itself identifies the operation
-// Compute operations
-const PipelineBinding = struct { handle: mtl.MTLComputePipelineStateRef };
-const BufferBinding = struct { handle: mtl.MTLBufferRef, offset: u64, index: u64 };
-const TextureBinding = struct { handle: mtl.MTLTextureRef, index: u64 };
-const BytesBinding = struct { ptr: *const anyopaque, len: usize, index: u64 };
-const DispatchInfo = struct { grid: Size, threads: Size };
-const Dispatch2dInfo = struct { width: u64, height: u64 };
-const BarrierInfo = struct { scope: BarrierScope };
-
-// Blit operations
-const CopyInfo = struct { src: mtl.MTLBufferRef, src_offset: u64, dst: mtl.MTLBufferRef, dst_offset: u64, size: u64 };
-const FillInfo = struct { buffer: mtl.MTLBufferRef, offset: u64, size: u64, value: u8 };
-
-// Accel operations
-const AccelBuildInfo = struct { accel: mtl.MTLAccelerationStructureRef, descriptor: mtl.MTLAccelerationStructureDescriptorRef, scratch: mtl.MTLBufferRef, scratch_offset: u64 };
-const AccelRefitInfo = struct { src: mtl.MTLAccelerationStructureRef, descriptor: mtl.MTLAccelerationStructureDescriptorRef, dst: mtl.MTLAccelerationStructureRef, scratch: mtl.MTLBufferRef, scratch_offset: u64 };
-const AccelCopyInfo = struct { src: mtl.MTLAccelerationStructureRef, dst: mtl.MTLAccelerationStructureRef };
-const AccelCompactInfo = struct { src: mtl.MTLAccelerationStructureRef, dst: mtl.MTLAccelerationStructureRef };
-const AccelWriteSizeInfo = struct { accel: mtl.MTLAccelerationStructureRef, buffer: mtl.MTLBufferRef, offset: u64 };
-
-fn fieldName(comptime i: usize) [:0]const u8 {
-    return std.fmt.comptimePrint("f{d}", .{i});
-}
-
-fn makeField(comptime i: usize, comptime T: type) std.builtin.Type.StructField {
-    return .{
-        .name = fieldName(i),
-        .type = T,
-        .default_value_ptr = null,
-        .is_comptime = false,
-        .alignment = @alignOf(T),
-    };
-}
-
-/// Generate a struct type for storing operation data
-fn DataStruct(comptime types: []const type) type {
-    var fields: []const std.builtin.Type.StructField = &.{};
-    for (types, 0..) |T, i| {
-        fields = fields ++ &[_]std.builtin.Type.StructField{makeField(i, T)};
-    }
-    return @Type(.{ .@"struct" = .{
-        .layout = .auto,
-        .fields = fields,
-        .decls = &.{},
-        .is_tuple = false,
-    } });
-}
-
-/// Compute command builder - comptime type grows with each operation
-pub fn Compute(comptime types: []const type, comptime concurrent: bool) type {
-    return struct {
-        data: Data,
-        const Self = @This();
-        const Data = DataStruct(types);
-        const n = types.len;
-        pub const encoder_kind: EncoderKind = .compute;
-        pub const is_concurrent = concurrent;
-
-        pub fn init(pipeline: ComputePipeline) Compute(&[_]type{PipelineBinding}, concurrent) {
-            var result: Compute(&[_]type{PipelineBinding}, concurrent) = .{ .data = undefined };
-            @field(result.data, fieldName(0)) = .{ .handle = pipeline.handle };
-            return result;
-        }
-
-        pub fn setPipeline(self: Self, pipeline: ComputePipeline) Compute(types ++ &[_]type{PipelineBinding}, concurrent) {
-            var result: Compute(types ++ &[_]type{PipelineBinding}, concurrent) = .{ .data = undefined };
-            inline for (0..n) |i| @field(result.data, fieldName(i)) = @field(self.data, fieldName(i));
-            @field(result.data, fieldName(n)) = .{ .handle = pipeline.handle };
-            return result;
-        }
-
-        pub fn setBuffer(self: Self, buffer: anytype, index: u64, opts: struct { offset: u64 = 0 }) Compute(types ++ &[_]type{BufferBinding}, concurrent) {
-            const handle = if (@hasField(@TypeOf(buffer), "handle")) buffer.handle else buffer;
-            var result: Compute(types ++ &[_]type{BufferBinding}, concurrent) = .{ .data = undefined };
-            inline for (0..n) |i| @field(result.data, fieldName(i)) = @field(self.data, fieldName(i));
-            @field(result.data, fieldName(n)) = .{ .handle = handle, .offset = opts.offset, .index = index };
-            return result;
-        }
-
-        pub fn setTexture(self: Self, texture: Texture, index: u64) Compute(types ++ &[_]type{TextureBinding}, concurrent) {
-            var result: Compute(types ++ &[_]type{TextureBinding}, concurrent) = .{ .data = undefined };
-            inline for (0..n) |i| @field(result.data, fieldName(i)) = @field(self.data, fieldName(i));
-            @field(result.data, fieldName(n)) = .{ .handle = texture.handle, .index = index };
-            return result;
-        }
-
-        pub fn setBytes(self: Self, bytes: anytype, index: u64) Compute(types ++ &[_]type{BytesBinding}, concurrent) {
-            var result: Compute(types ++ &[_]type{BytesBinding}, concurrent) = .{ .data = undefined };
-            inline for (0..n) |i| @field(result.data, fieldName(i)) = @field(self.data, fieldName(i));
-            const T = @TypeOf(bytes);
-            const ptr = if (@typeInfo(T) == .pointer) bytes else &bytes;
-            @field(result.data, fieldName(n)) = .{ .ptr = @ptrCast(ptr), .len = @sizeOf(std.meta.Child(if (@typeInfo(T) == .pointer) T else *const T)), .index = index };
-            return result;
-        }
-
-        pub fn dispatch(self: Self, grid: Size, threads: Size) Compute(types ++ &[_]type{DispatchInfo}, concurrent) {
-            var result: Compute(types ++ &[_]type{DispatchInfo}, concurrent) = .{ .data = undefined };
-            inline for (0..n) |i| @field(result.data, fieldName(i)) = @field(self.data, fieldName(i));
-            @field(result.data, fieldName(n)) = .{ .grid = grid, .threads = threads };
-            return result;
-        }
-
-        pub fn dispatch1d(self: Self, pipeline: ComputePipeline, count: usize) Compute(types ++ &[_]type{DispatchInfo}, concurrent) {
-            const grid, const threads = pipeline.gridFor1d(count);
-            return self.dispatch(grid, threads);
-        }
-
-        pub fn dispatch2d(self: Self, width: u64, height: u64) Compute(types ++ &[_]type{Dispatch2dInfo}, concurrent) {
-            var result: Compute(types ++ &[_]type{Dispatch2dInfo}, concurrent) = .{ .data = undefined };
-            inline for (0..n) |i| @field(result.data, fieldName(i)) = @field(self.data, fieldName(i));
-            @field(result.data, fieldName(n)) = .{ .width = width, .height = height };
-            return result;
-        }
-
-        pub fn barrier(self: Self, scope: BarrierScope) Compute(types ++ &[_]type{BarrierInfo}, concurrent) {
-            var result: Compute(types ++ &[_]type{BarrierInfo}, concurrent) = .{ .data = undefined };
-            inline for (0..n) |i| @field(result.data, fieldName(i)) = @field(self.data, fieldName(i));
-            @field(result.data, fieldName(n)) = .{ .scope = scope };
-            return result;
-        }
-
-        /// Encode compute commands to an encoder
-        pub fn encode(self: *const Self, enc: mtl.MTLComputeCommandEncoderRef) void {
-            inline for (types, 0..) |T, i| {
-                const val = @field(self.data, fieldName(i));
-                if (T == PipelineBinding) {
-                    mtl.MTLComputeCommandEncoderSetComputePipelineState(enc, val.handle);
-                } else if (T == BufferBinding) {
-                    mtl.MTLComputeCommandEncoderSetBuffer(enc, val.handle, val.offset, val.index);
-                } else if (T == TextureBinding) {
-                    mtl.MTLComputeCommandEncoderSetTexture(enc, val.handle, val.index);
-                } else if (T == BytesBinding) {
-                    mtl.MTLComputeCommandEncoderSetBytes(enc, val.ptr, val.len, val.index);
-                } else if (T == DispatchInfo) {
-                    mtl.MTLComputeCommandEncoderDispatchThreadgroups(
-                        enc,
-                        mtl.MTLSize{ .width = val.grid.width, .height = val.grid.height, .depth = val.grid.depth },
-                        mtl.MTLSize{ .width = val.threads.width, .height = val.threads.height, .depth = val.threads.depth },
-                    );
-                } else if (T == Dispatch2dInfo) {
-                    const grid_w = (val.width + 15) / 16;
-                    const grid_h = (val.height + 15) / 16;
-                    mtl.MTLComputeCommandEncoderDispatchThreadgroups(
-                        enc,
-                        mtl.MTLSize{ .width = grid_w, .height = grid_h, .depth = 1 },
-                        mtl.MTLSize{ .width = 16, .height = 16, .depth = 1 },
-                    );
-                } else if (T == BarrierInfo) {
-                    mtl.MTLComputeCommandEncoderMemoryBarrierWithScope(enc, @intFromEnum(val.scope));
-                }
-            }
-        }
-
-        /// Finalize: create command buffer, encode, commit
-        pub fn finalize(self: *const Self, queue: mtl.MTLCommandQueueRef) mtl.MTLCommandBufferRef {
-            const cmd_buf = mtl.MTLCommandQueueCommandBuffer(queue) orelse @panic("Failed to create command buffer");
-            const enc = if (concurrent)
-                mtl.MTLCommandBufferComputeCommandEncoderWithDispatchType(cmd_buf, mtl.MTLDispatchTypeConcurrent)
-            else
-                mtl.MTLCommandBufferComputeCommandEncoder(cmd_buf);
-            self.encode(enc);
-            mtl.MTLComputeCommandEncoderEndEncoding(enc);
-            mtl.MTLCommandBufferCommit(cmd_buf);
-            return cmd_buf;
-        }
-    };
-}
-
-/// Blit command builder - for memory operations
-pub fn Blit(comptime types: []const type) type {
-    return struct {
-        data: Data,
-        const Self = @This();
-        const Data = DataStruct(types);
-        const n = types.len;
-        pub const encoder_kind: EncoderKind = .blit;
-
-        pub fn init() Blit(&[_]type{}) {
-            return .{ .data = .{} };
-        }
-
-        pub fn copy(self: Self, src: anytype, dst: anytype, size: u64, opts: struct { src_offset: u64 = 0, dst_offset: u64 = 0 }) Blit(types ++ &[_]type{CopyInfo}) {
-            const src_handle = if (@hasField(@TypeOf(src), "handle")) src.handle else src;
-            const dst_handle = if (@hasField(@TypeOf(dst), "handle")) dst.handle else dst;
-            var result: Blit(types ++ &[_]type{CopyInfo}) = .{ .data = undefined };
-            inline for (0..n) |i| @field(result.data, fieldName(i)) = @field(self.data, fieldName(i));
-            @field(result.data, fieldName(n)) = .{ .src = src_handle, .src_offset = opts.src_offset, .dst = dst_handle, .dst_offset = opts.dst_offset, .size = size };
-            return result;
-        }
-
-        pub fn fill(self: Self, buffer: anytype, value: u8, size: u64, opts: struct { offset: u64 = 0 }) Blit(types ++ &[_]type{FillInfo}) {
-            const handle = if (@hasField(@TypeOf(buffer), "handle")) buffer.handle else buffer;
-            var result: Blit(types ++ &[_]type{FillInfo}) = .{ .data = undefined };
-            inline for (0..n) |i| @field(result.data, fieldName(i)) = @field(self.data, fieldName(i));
-            @field(result.data, fieldName(n)) = .{ .buffer = handle, .offset = opts.offset, .size = size, .value = value };
-            return result;
-        }
-
-        /// Encode blit commands to an encoder
-        pub fn encode(self: *const Self, enc: mtl.MTLBlitCommandEncoderRef) void {
-            inline for (types, 0..) |T, i| {
-                const val = @field(self.data, fieldName(i));
-                if (T == CopyInfo) {
-                    mtl.MTLBlitCommandEncoderCopyFromBuffer(enc, val.src, val.src_offset, val.dst, val.dst_offset, val.size);
-                } else if (T == FillInfo) {
-                    mtl.MTLBlitCommandEncoderFillBuffer(enc, val.buffer, val.offset, val.size, val.value);
-                }
-            }
-        }
-
-        /// Finalize: create command buffer, encode, commit
-        pub fn finalize(self: *const Self, queue: mtl.MTLCommandQueueRef) mtl.MTLCommandBufferRef {
-            const cmd_buf = mtl.MTLCommandQueueCommandBuffer(queue) orelse @panic("Failed to create command buffer");
-            const enc = mtl.MTLCommandBufferBlitCommandEncoder(cmd_buf);
-            self.encode(enc);
-            mtl.MTLBlitCommandEncoderEndEncoding(enc);
-            mtl.MTLCommandBufferCommit(cmd_buf);
-            return cmd_buf;
-        }
-    };
-}
-
-/// Accel command builder - for acceleration structure operations
-pub fn Accel(comptime types: []const type) type {
-    return struct {
-        data: Data,
-        const Self = @This();
-        const Data = DataStruct(types);
-        const n = types.len;
-        pub const encoder_kind: EncoderKind = .accel;
-
-        pub fn init() Accel(&[_]type{}) {
-            return .{ .data = .{} };
-        }
-
-        pub fn build(
-            self: Self,
-            acceleration_structure: AccelerationStructure,
-            descriptor: anytype,
-            scratch_buffer: anytype,
-            opts: struct { scratch_offset: u64 = 0 },
-        ) Accel(types ++ &[_]type{AccelBuildInfo}) {
-            const desc_handle = if (@hasField(@TypeOf(descriptor), "handle")) descriptor.handle else descriptor;
-            const scratch_handle = if (@hasField(@TypeOf(scratch_buffer), "handle")) scratch_buffer.handle else scratch_buffer;
-            var result: Accel(types ++ &[_]type{AccelBuildInfo}) = .{ .data = undefined };
-            inline for (0..n) |i| @field(result.data, fieldName(i)) = @field(self.data, fieldName(i));
-            @field(result.data, fieldName(n)) = .{
-                .accel = acceleration_structure.handle,
-                .descriptor = desc_handle,
-                .scratch = scratch_handle,
-                .scratch_offset = opts.scratch_offset,
-            };
-            return result;
-        }
-
-        pub fn refit(
-            self: Self,
-            src: AccelerationStructure,
-            descriptor: anytype,
-            dst: AccelerationStructure,
-            scratch_buffer: anytype,
-            opts: struct { scratch_offset: u64 = 0 },
-        ) Accel(types ++ &[_]type{AccelRefitInfo}) {
-            const desc_handle = if (@hasField(@TypeOf(descriptor), "handle")) descriptor.handle else descriptor;
-            const scratch_handle = if (@hasField(@TypeOf(scratch_buffer), "handle")) scratch_buffer.handle else scratch_buffer;
-            var result: Accel(types ++ &[_]type{AccelRefitInfo}) = .{ .data = undefined };
-            inline for (0..n) |i| @field(result.data, fieldName(i)) = @field(self.data, fieldName(i));
-            @field(result.data, fieldName(n)) = .{
-                .src = src.handle,
-                .descriptor = desc_handle,
-                .dst = dst.handle,
-                .scratch = scratch_handle,
-                .scratch_offset = opts.scratch_offset,
-            };
-            return result;
-        }
-
-        pub fn copy(self: Self, src: AccelerationStructure, dst: AccelerationStructure) Accel(types ++ &[_]type{AccelCopyInfo}) {
-            var result: Accel(types ++ &[_]type{AccelCopyInfo}) = .{ .data = undefined };
-            inline for (0..n) |i| @field(result.data, fieldName(i)) = @field(self.data, fieldName(i));
-            @field(result.data, fieldName(n)) = .{ .src = src.handle, .dst = dst.handle };
-            return result;
-        }
-
-        pub fn copyAndCompact(self: Self, src: AccelerationStructure, dst: AccelerationStructure) Accel(types ++ &[_]type{AccelCompactInfo}) {
-            var result: Accel(types ++ &[_]type{AccelCompactInfo}) = .{ .data = undefined };
-            inline for (0..n) |i| @field(result.data, fieldName(i)) = @field(self.data, fieldName(i));
-            @field(result.data, fieldName(n)) = .{ .src = src.handle, .dst = dst.handle };
-            return result;
-        }
-
-        pub fn writeCompactedSize(
-            self: Self,
-            acceleration_structure: AccelerationStructure,
-            buffer: anytype,
-            opts: struct { offset: u64 = 0 },
-        ) Accel(types ++ &[_]type{AccelWriteSizeInfo}) {
-            const buf_handle = if (@hasField(@TypeOf(buffer), "handle")) buffer.handle else buffer;
-            var result: Accel(types ++ &[_]type{AccelWriteSizeInfo}) = .{ .data = undefined };
-            inline for (0..n) |i| @field(result.data, fieldName(i)) = @field(self.data, fieldName(i));
-            @field(result.data, fieldName(n)) = .{
-                .accel = acceleration_structure.handle,
-                .buffer = buf_handle,
-                .offset = opts.offset,
-            };
-            return result;
-        }
-
-        /// Encode accel commands to an encoder
-        pub fn encode(self: *const Self, enc: mtl.MTLAccelerationStructureCommandEncoderRef) void {
-            inline for (types, 0..) |T, i| {
-                const val = @field(self.data, fieldName(i));
-                if (T == AccelBuildInfo) {
-                    mtl.MTLAccelerationStructureCommandEncoderBuildAccelerationStructure(enc, val.accel, val.descriptor, val.scratch, val.scratch_offset);
-                } else if (T == AccelRefitInfo) {
-                    mtl.MTLAccelerationStructureCommandEncoderRefitAccelerationStructure(enc, val.src, val.descriptor, val.dst, val.scratch, val.scratch_offset);
-                } else if (T == AccelCopyInfo) {
-                    mtl.MTLAccelerationStructureCommandEncoderCopyAccelerationStructure(enc, val.src, val.dst);
-                } else if (T == AccelCompactInfo) {
-                    mtl.MTLAccelerationStructureCommandEncoderCopyAndCompactAccelerationStructure(enc, val.src, val.dst);
-                } else if (T == AccelWriteSizeInfo) {
-                    mtl.MTLAccelerationStructureCommandEncoderWriteCompactedAccelerationStructureSize(enc, val.accel, val.buffer, val.offset);
-                }
-            }
-        }
-
-        /// Finalize: create command buffer, encode, commit
-        pub fn finalize(self: *const Self, queue: mtl.MTLCommandQueueRef) mtl.MTLCommandBufferRef {
-            const cmd_buf = mtl.MTLCommandQueueCommandBuffer(queue) orelse @panic("Failed to create command buffer");
-            const enc = mtl.MTLCommandBufferAccelerationStructureCommandEncoder(cmd_buf);
-            self.encode(enc);
-            mtl.MTLAccelerationStructureCommandEncoderEndEncoding(enc);
-            mtl.MTLCommandBufferCommit(cmd_buf);
-            return cmd_buf;
-        }
-    };
-}
-
-/// Join multiple commands into a single submission
-pub fn join(commands: anytype) JoinedCommand(@TypeOf(commands)) {
-    return .{ .commands = commands };
-}
-
-fn JoinedCommand(comptime T: type) type {
-    return struct {
-        commands: T,
-        const Self = @This();
-
-        pub fn finalize(self: *const Self, queue: mtl.MTLCommandQueueRef) mtl.MTLCommandBufferRef {
-            const cmd_buf = mtl.MTLCommandQueueCommandBuffer(queue) orelse @panic("Failed to create command buffer");
-
-            // Each command gets its own encoder (simple, correct)
-            inline for (std.meta.fields(T)) |field| {
-                const cmd = &@field(self.commands, field.name);
-                const CmdType = @TypeOf(cmd.*);
-
-                if (@hasDecl(CmdType, "encoder_kind")) {
-                    if (CmdType.encoder_kind == .compute) {
-                        const enc = if (@hasDecl(CmdType, "is_concurrent") and CmdType.is_concurrent)
-                            mtl.MTLCommandBufferComputeCommandEncoderWithDispatchType(cmd_buf, mtl.MTLDispatchTypeConcurrent)
-                        else
-                            mtl.MTLCommandBufferComputeCommandEncoder(cmd_buf);
-                        cmd.encode(enc);
-                        mtl.MTLComputeCommandEncoderEndEncoding(enc);
-                    } else if (CmdType.encoder_kind == .blit) {
-                        const enc = mtl.MTLCommandBufferBlitCommandEncoder(cmd_buf);
-                        cmd.encode(enc);
-                        mtl.MTLBlitCommandEncoderEndEncoding(enc);
-                    } else if (CmdType.encoder_kind == .accel) {
-                        const enc = mtl.MTLCommandBufferAccelerationStructureCommandEncoder(cmd_buf);
-                        cmd.encode(enc);
-                        mtl.MTLAccelerationStructureCommandEncoderEndEncoding(enc);
-                    }
-                }
-            }
-
-            mtl.MTLCommandBufferCommit(cmd_buf);
-            return cmd_buf;
-        }
-    };
-}
-
-/// Entry points
-pub fn compute(pipeline: ComputePipeline) Compute(&[_]type{PipelineBinding}, false) {
-    return Compute(&[_]type{}, false).init(pipeline);
-}
-
-pub fn computeConcurrent(pipeline: ComputePipeline) Compute(&[_]type{PipelineBinding}, true) {
-    return Compute(&[_]type{}, true).init(pipeline);
-}
-
-pub fn blit() Blit(&[_]type{}) {
-    return Blit(&[_]type{}).init();
-}
-
-pub fn accel() Accel(&[_]type{}) {
-    return Accel(&[_]type{}).init();
-}
-
-/// Fence for async submission - call wait() to block until complete
 pub const Fence = struct {
-    command_buffer: ?mtl.MTLCommandBufferRef,
+    command_buffer: mtl.MTLCommandBufferRef,
 
     pub fn wait(self: Fence) void {
-        if (self.command_buffer) |buf| {
-            mtl.MTLCommandBufferWaitUntilCompleted(buf);
-        }
+        mtl.MTLCommandBufferWaitUntilCompleted(self.command_buffer);
     }
 };
 
-/// Event for GPU-GPU synchronization across command buffers
-/// Use to coordinate work between different submissions or queues.
 pub const Event = struct {
     handle: mtl.MTLEventRef,
-
-    pub fn init(device: Device) Event {
-        return .{ .handle = mtl.MTLDeviceNewEvent(device.handle) };
-    }
 };
 
-/// SharedEvent extends Event with CPU-GPU synchronization
-/// Can also synchronize across processes.
 pub const SharedEvent = struct {
     handle: mtl.MTLSharedEventRef,
 
-    pub fn init(device: Device) SharedEvent {
-        return .{ .handle = mtl.MTLDeviceNewSharedEvent(device.handle) };
-    }
-
-    /// Get current signaled value (can be read from CPU)
     pub fn signaledValue(self: SharedEvent) u64 {
         return mtl.MTLSharedEventSignaledValue(self.handle);
     }
 
-    /// Set signaled value from CPU (allows CPU to signal GPU)
     pub fn setSignaledValue(self: SharedEvent, value: u64) void {
         mtl.MTLSharedEventSetSignaledValue(self.handle, value);
     }
 };
+
+// =============================================================================
+// Descriptors
+// =============================================================================
+
+pub const BufferOptions = struct {
+    storage: StorageMode = .shared,
+};
+
+pub const TextureDescriptor = struct {
+    texture_type: TextureType = .@"2d",
+    pixel_format: PixelFormat = .rgba8unorm,
+    width: u32 = 1,
+    height: u32 = 1,
+    depth: u32 = 1,
+    mipmap_levels: u32 = 1,
+    array_length: u32 = 1,
+    usage: TextureUsage = .{ .read = true, .write = true },
+    storage: StorageMode = .shared,
+};
+
+pub const ComputePipelineDescriptor = struct {
+    source: [*:0]const u8,
+    function: [*:0]const u8,
+};
+
+pub const AccelSizes = struct {
+    acceleration_structure_size: u64,
+    build_scratch_buffer_size: u64,
+    refit_scratch_buffer_size: u64,
+};
+
+// =============================================================================
+// Acceleration Structure Descriptors
+// =============================================================================
+
+pub const TriangleGeometryDescriptor = struct {
+    handle: mtl.MTLAccelerationStructureTriangleGeometryDescriptorRef,
+
+    pub fn init() TriangleGeometryDescriptor {
+        return .{ .handle = mtl.MTLAccelerationStructureTriangleGeometryDescriptorCreate() };
+    }
+
+    pub fn vertexBuffer(self: TriangleGeometryDescriptor, buf: anytype, stride: u64) TriangleGeometryDescriptor {
+        return self.vertexBufferOffset(buf, 0, stride);
+    }
+
+    pub fn vertexBufferOffset(self: TriangleGeometryDescriptor, buf: anytype, offset: u64, stride: u64) TriangleGeometryDescriptor {
+        const handle = getHandle(buf);
+        mtl.MTLAccelerationStructureTriangleGeometryDescriptorSetVertexBuffer(self.handle, handle);
+        mtl.MTLAccelerationStructureTriangleGeometryDescriptorSetVertexBufferOffset(self.handle, offset);
+        mtl.MTLAccelerationStructureTriangleGeometryDescriptorSetVertexStride(self.handle, stride);
+        return self;
+    }
+
+    pub fn indexBuffer(self: TriangleGeometryDescriptor, buf: anytype, index_type: IndexType) TriangleGeometryDescriptor {
+        return self.indexBufferOffset(buf, index_type, 0);
+    }
+
+    pub fn indexBufferOffset(self: TriangleGeometryDescriptor, buf: anytype, index_type: IndexType, offset: u64) TriangleGeometryDescriptor {
+        const handle = getHandle(buf);
+        mtl.MTLAccelerationStructureTriangleGeometryDescriptorSetIndexBuffer(self.handle, handle);
+        mtl.MTLAccelerationStructureTriangleGeometryDescriptorSetIndexBufferOffset(self.handle, offset);
+        mtl.MTLAccelerationStructureTriangleGeometryDescriptorSetIndexType(self.handle, @intFromEnum(index_type));
+        return self;
+    }
+
+    pub fn triangleCount(self: TriangleGeometryDescriptor, count: u64) TriangleGeometryDescriptor {
+        mtl.MTLAccelerationStructureTriangleGeometryDescriptorSetTriangleCount(self.handle, count);
+        return self;
+    }
+};
+
+pub const BoundingBoxGeometryDescriptor = struct {
+    handle: mtl.MTLAccelerationStructureBoundingBoxGeometryDescriptorRef,
+
+    pub fn init() BoundingBoxGeometryDescriptor {
+        return .{ .handle = mtl.MTLAccelerationStructureBoundingBoxGeometryDescriptorCreate() };
+    }
+
+    pub fn boundingBoxBuffer(self: BoundingBoxGeometryDescriptor, buf: anytype, stride: u64) BoundingBoxGeometryDescriptor {
+        return self.boundingBoxBufferOffset(buf, 0, stride);
+    }
+
+    pub fn boundingBoxBufferOffset(self: BoundingBoxGeometryDescriptor, buf: anytype, offset: u64, stride: u64) BoundingBoxGeometryDescriptor {
+        const handle = getHandle(buf);
+        mtl.MTLAccelerationStructureBoundingBoxGeometryDescriptorSetBoundingBoxBuffer(self.handle, handle);
+        mtl.MTLAccelerationStructureBoundingBoxGeometryDescriptorSetBoundingBoxBufferOffset(self.handle, offset);
+        mtl.MTLAccelerationStructureBoundingBoxGeometryDescriptorSetBoundingBoxStride(self.handle, stride);
+        return self;
+    }
+
+    pub fn boundingBoxCount(self: BoundingBoxGeometryDescriptor, count: u64) BoundingBoxGeometryDescriptor {
+        mtl.MTLAccelerationStructureBoundingBoxGeometryDescriptorSetBoundingBoxCount(self.handle, count);
+        return self;
+    }
+};
+
+pub const PrimitiveAccelerationStructureDescriptor = struct {
+    handle: mtl.MTLPrimitiveAccelerationStructureDescriptorRef,
+    geometry_handles: [64]*anyopaque = undefined,
+    geometry_count: usize = 0,
+
+    pub fn init() PrimitiveAccelerationStructureDescriptor {
+        return .{ .handle = mtl.MTLPrimitiveAccelerationStructureDescriptorCreate() };
+    }
+
+    pub fn addGeometry(self: *PrimitiveAccelerationStructureDescriptor, geometry: anytype) void {
+        if (self.geometry_count >= 64) return;
+        const geo_handle = if (@hasField(@TypeOf(geometry), "handle")) geometry.handle else geometry;
+        self.geometry_handles[self.geometry_count] = geo_handle.?;
+        self.geometry_count += 1;
+    }
+
+    pub fn build(self: *PrimitiveAccelerationStructureDescriptor) void {
+        if (self.geometry_count > 0) {
+            mtl.MTLPrimitiveAccelerationStructureDescriptorSetGeometryDescriptors(
+                self.handle,
+                @ptrCast(&self.geometry_handles),
+                self.geometry_count,
+            );
+        }
+    }
+};
+
+pub const InstanceAccelerationStructureDescriptor = struct {
+    handle: mtl.MTLInstanceAccelerationStructureDescriptorRef,
+    blas_handles: [256]mtl.MTLAccelerationStructureRef = undefined,
+    blas_count: usize = 0,
+
+    pub fn init() InstanceAccelerationStructureDescriptor {
+        return .{ .handle = mtl.MTLInstanceAccelerationStructureDescriptorCreate() };
+    }
+
+    pub fn instanceDescriptorBuffer(self: InstanceAccelerationStructureDescriptor, buf: anytype, stride: u64) InstanceAccelerationStructureDescriptor {
+        return self.instanceDescriptorBufferOffset(buf, 0, stride);
+    }
+
+    pub fn instanceDescriptorBufferOffset(self: InstanceAccelerationStructureDescriptor, buf: anytype, offset: u64, stride: u64) InstanceAccelerationStructureDescriptor {
+        const handle = getHandle(buf);
+        mtl.MTLInstanceAccelerationStructureDescriptorSetInstanceDescriptorBuffer(self.handle, handle);
+        mtl.MTLInstanceAccelerationStructureDescriptorSetInstanceDescriptorBufferOffset(self.handle, offset);
+        mtl.MTLInstanceAccelerationStructureDescriptorSetInstanceDescriptorStride(self.handle, stride);
+        return self;
+    }
+
+    pub fn instanceCount(self: InstanceAccelerationStructureDescriptor, count: u64) InstanceAccelerationStructureDescriptor {
+        mtl.MTLInstanceAccelerationStructureDescriptorSetInstanceCount(self.handle, count);
+        return self;
+    }
+
+    pub fn addInstancedAccelerationStructure(self: *InstanceAccelerationStructureDescriptor, accel_struct: AccelerationStructure) void {
+        if (self.blas_count >= 256) return;
+        self.blas_handles[self.blas_count] = accel_struct.handle;
+        self.blas_count += 1;
+    }
+
+    pub fn build(self: *InstanceAccelerationStructureDescriptor) void {
+        if (self.blas_count > 0) {
+            mtl.MTLInstanceAccelerationStructureDescriptorSetInstancedAccelerationStructures(
+                self.handle,
+                @ptrCast(&self.blas_handles),
+                self.blas_count,
+            );
+        }
+    }
+};
+
+// =============================================================================
+// Enums
+// =============================================================================
+
+pub const StorageMode = enum(u32) {
+    shared = 0,
+    managed = 1,
+    private = 2,
+
+    fn toResourceOptions(self: StorageMode) u64 {
+        return @as(u64, @intFromEnum(self)) << 4;
+    }
+};
+
+pub const TextureType = enum(u32) {
+    @"1d" = 0,
+    @"1d_array" = 1,
+    @"2d" = 2,
+    @"2d_array" = 3,
+    @"2d_multisample" = 4,
+    cube = 5,
+    cube_array = 6,
+    @"3d" = 7,
+};
+
+pub const PixelFormat = enum(u32) {
+    r8unorm = 10,
+    r16float = 25,
+    rg8unorm = 30,
+    r32float = 55,
+    rg16float = 65,
+    rgba8unorm = 70,
+    rgba8unorm_srgb = 71,
+    rgba8snorm = 72,
+    rgba8uint = 73,
+    rgba8sint = 74,
+    bgra8unorm = 80,
+    bgra8unorm_srgb = 81,
+    rg32float = 105,
+    rgba16float = 115,
+    rgba32float = 125,
+};
+
+pub const TextureUsage = struct {
+    read: bool = false,
+    write: bool = false,
+    render_target: bool = false,
+
+    fn toMtl(self: TextureUsage) u32 {
+        var result: u32 = 0;
+        if (self.read) result |= 1;
+        if (self.write) result |= 2;
+        if (self.render_target) result |= 4;
+        return result;
+    }
+};
+
+pub const BarrierScope = enum(u32) {
+    buffers = 1,
+    textures = 2,
+    render_targets = 4,
+
+    pub fn all() BarrierScope {
+        return @enumFromInt(1 | 2);
+    }
+};
+
+pub const IndexType = enum(u32) {
+    uint16 = 0,
+    uint32 = 1,
+};
+
+pub const Size = struct {
+    width: usize = 1,
+    height: usize = 1,
+    depth: usize = 1,
+
+    fn toMtl(self: Size) mtl.MTLSize {
+        return .{
+            .width = self.width,
+            .height = self.height,
+            .depth = self.depth,
+        };
+    }
+};
+
+// =============================================================================
+// Helpers
+// =============================================================================
+
+fn getHandle(resource: anytype) mtl.MTLBufferRef {
+    const T = @TypeOf(resource);
+    if (@hasField(T, "handle")) {
+        return resource.handle;
+    } else {
+        return resource;
+    }
+}
+
+fn getByteSize(resource: anytype) usize {
+    const T = @TypeOf(resource);
+    if (@hasDecl(T, "byteSize")) {
+        return resource.byteSize();
+    } else if (@hasField(T, "len")) {
+        return resource.len;
+    } else {
+        return 0;
+    }
+}
