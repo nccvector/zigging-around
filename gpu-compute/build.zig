@@ -1,20 +1,6 @@
 const std = @import("std");
 
-pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
-
-    // Fetch metal-cpp from GitHub
-    const metal_cpp_dep = b.dependency("metal_cpp", .{});
-
-    const exe = b.addExecutable(.{
-        .name = "gpu-compute",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
+pub fn setup_metal_target(b: *std.Build, metal_cpp_dep: *std.Build.Dependency, exe: *std.Build.Step.Compile) void {
 
     // Add C header include path for @cImport
     exe.addIncludePath(b.path("src"));
@@ -50,8 +36,36 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
 
-    const run_step = b.step("run", "Run the program");
+    const run_step = b.step(exe.name, "Run the program");
     run_step.dependOn(&run_cmd.step);
+}
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    // Fetch metal-cpp from GitHub
+    const metal_cpp_dep = b.dependency("metal_cpp", .{});
+
+    const main = b.addExecutable(.{
+        .name = "main",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    setup_metal_target(b, metal_cpp_dep, main);
+
+    const lesson_storage_modes = b.addExecutable(.{
+        .name = "lesson-storage-modes",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/lesson_storage_modes.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    setup_metal_target(b, metal_cpp_dep, lesson_storage_modes);
 
     // Tests
     const unit_tests = b.addTest(.{
