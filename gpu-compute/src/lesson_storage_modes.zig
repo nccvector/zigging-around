@@ -37,9 +37,10 @@ pub fn main() !void {
             .copy(shared, private)
             .end();
 
-        cmd.createComputeEncoder(pipeline, .{})
-            .setBuffer(private, 0)
-            .dispatch1d(COUNT)
+        cmd.createComputeEncoder(.{})
+            .dispatch1d(pipeline, COUNT, .{
+                .buffers = .{.{ .buf = private, .index = 0 }},
+            })
             .end();
 
         // Copy data device -> host

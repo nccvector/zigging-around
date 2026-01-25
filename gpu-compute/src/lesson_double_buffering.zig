@@ -113,10 +113,12 @@ pub fn main() !void {
                 .end();
 
             // Compute
-            cmd.createComputeEncoder(pipeline, .{})
-                .setBuffer(gpu_buffer, 0)
-                .setBytes(@as(u32, @intCast(i)), 1)
-                .dispatch1d(BUFFER_SIZE)
+            const frame_num: u32 = @intCast(i);
+            cmd.createComputeEncoder(.{})
+                .dispatch1d(pipeline, BUFFER_SIZE, .{
+                    .buffers = .{.{ .buf = gpu_buffer, .index = 0 }},
+                    .bytes = .{.{ .data = &frame_num, .index = 1 }},
+                })
                 .end();
 
             // Copy data device -> host

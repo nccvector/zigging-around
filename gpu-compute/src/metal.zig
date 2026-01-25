@@ -289,7 +289,7 @@ pub const CommandBuffer = struct {
     // Encoder Creation
     // -------------------------------------------------------------------------
 
-    pub fn createComputeEncoder(self: *CommandBuffer, pipeline: ComputePipeline, opts: ComputeEncoderOptions) *ComputeEncoder {
+    pub fn createComputeEncoder(self: *CommandBuffer, opts: ComputeEncoderOptions) *ComputeEncoder {
         self.endCurrentEncoder();
 
         const enc = if (opts.concurrent)
@@ -299,13 +299,10 @@ pub const CommandBuffer = struct {
 
         self.current_encoder = .{ .compute = enc };
 
-        // Set initial pipeline
-        mtl.MTLComputeCommandEncoderSetComputePipelineState(enc, pipeline.handle);
-
         self.compute_encoder = .{
             .handle = enc,
             .cmd = self,
-            .current_pipeline = pipeline,
+            .current_pipeline = null,
         };
         return &self.compute_encoder;
     }
@@ -354,112 +351,107 @@ pub const ComputeEncoderOptions = struct {
 };
 
 // =============================================================================
+// Dispatch Options - Atomic dispatch with explicit bindings
+// =============================================================================
+
+/// Buffer binding with explicit index
+pub const BufferBinding = struct {
+    buf: mtl.MTLBufferRef,
+    index: u32,
+    offset: usize = 0,
+};
+
+/// Bytes binding with explicit index
+pub const BytesBinding = struct {
+    data: *const anyopaque,
+    len: usize,
+    index: u32,
+};
+
+/// Texture binding with explicit index
+pub const TextureBinding = struct {
+    tex: mtl.MTLTextureRef,
+    index: u32,
+};
+
+/// Threadgroup memory binding with explicit index
+pub const ThreadgroupBinding = struct {
+    length: usize,
+    index: u32,
+};
+
+/// Acceleration structure binding with explicit index
+pub const AccelBinding = struct {
+    accel: mtl.MTLAccelerationStructureRef,
+    index: u32,
+};
+
+// =============================================================================
 // ComputeEncoder
 // =============================================================================
 
 pub const ComputeEncoder = struct {
     handle: mtl.MTLComputeCommandEncoderRef,
     cmd: *CommandBuffer,
-    current_pipeline: ComputePipeline,
+    current_pipeline: ?ComputePipeline,
 
     const Self = @This();
 
     // -------------------------------------------------------------------------
-    // Pipeline
+    // Dispatch - Atomic operations with all bindings in one call
     // -------------------------------------------------------------------------
 
-    /// Switch pipeline (cheap within same encoder!)
-    pub fn setPipeline(self: *Self, p: ComputePipeline) *Self {
-        mtl.MTLComputeCommandEncoderSetComputePipelineState(self.handle, p.handle);
-        self.current_pipeline = p;
+    /// 1D dispatch - complete recipe in one call
+    pub fn dispatch1d(self: *Self, pipeline: ComputePipeline, count: usize, opts: anytype) *Self {
+        self.applyBindings(pipeline, opts);
+
+        const max_threads = pipeline.maxThreadsPerThreadgroup();
+        const threads: usize = @min(max_threads, 1024);
+        const groups = (count + threads - 1) / threads;
+
+        mtl.MTLComputeCommandEncoderDispatchThreadgroups(
+            self.handle,
+            .{ .width = groups, .height = 1, .depth = 1 },
+            .{ .width = threads, .height = 1, .depth = 1 },
+        );
         return self;
     }
 
-    // -------------------------------------------------------------------------
-    // Buffer Binding
-    // -------------------------------------------------------------------------
+    /// 2D dispatch - complete recipe in one call
+    pub fn dispatch2d(self: *Self, pipeline: ComputePipeline, width: usize, height: usize, opts: anytype) *Self {
+        self.applyBindings(pipeline, opts);
 
-    /// Bind single buffer at index
-    pub fn setBuffer(self: *Self, buf: anytype, index: u32) *Self {
-        return self.setBufferOffset(buf, index, 0);
-    }
+        const groups_x = (width + 15) / 16;
+        const groups_y = (height + 15) / 16;
 
-    /// Bind single buffer at index with offset
-    pub fn setBufferOffset(self: *Self, buf: anytype, index: u32, offset: usize) *Self {
-        const handle = getHandle(buf);
-        mtl.MTLComputeCommandEncoderSetBuffer(self.handle, handle, offset, index);
+        mtl.MTLComputeCommandEncoderDispatchThreadgroups(
+            self.handle,
+            .{ .width = groups_x, .height = groups_y, .depth = 1 },
+            .{ .width = 16, .height = 16, .depth = 1 },
+        );
         return self;
     }
 
-    /// Bind multiple buffers starting at index 0
-    pub fn setBuffers(self: *Self, bufs: anytype) *Self {
-        const info = @typeInfo(@TypeOf(bufs));
-        if (info == .@"struct" and info.@"struct".is_tuple) {
-            inline for (bufs, 0..) |b, i| {
-                _ = self.setBuffer(b, @intCast(i));
-            }
-        }
+    /// 3D dispatch - complete recipe in one call
+    pub fn dispatch3d(self: *Self, pipeline: ComputePipeline, width: usize, height: usize, depth: usize, opts: anytype) *Self {
+        self.applyBindings(pipeline, opts);
+
+        const groups_x = (width + 7) / 8;
+        const groups_y = (height + 7) / 8;
+        const groups_z = (depth + 7) / 8;
+
+        mtl.MTLComputeCommandEncoderDispatchThreadgroups(
+            self.handle,
+            .{ .width = groups_x, .height = groups_y, .depth = groups_z },
+            .{ .width = 8, .height = 8, .depth = 8 },
+        );
         return self;
     }
 
-    // -------------------------------------------------------------------------
-    // Texture Binding
-    // -------------------------------------------------------------------------
+    /// Full control dispatch with explicit grid/threadgroup sizes
+    pub fn dispatch(self: *Self, pipeline: ComputePipeline, groups: Size, threads_per_group: Size, opts: anytype) *Self {
+        self.applyBindings(pipeline, opts);
 
-    pub fn setTexture(self: *Self, tex: Texture, index: u32) *Self {
-        mtl.MTLComputeCommandEncoderSetTexture(self.handle, tex.handle, index);
-        return self;
-    }
-
-    pub fn setTextures(self: *Self, texs: anytype) *Self {
-        const info = @typeInfo(@TypeOf(texs));
-        if (info == .@"struct" and info.@"struct".is_tuple) {
-            inline for (texs, 0..) |t, i| {
-                _ = self.setTexture(t, @intCast(i));
-            }
-        }
-        return self;
-    }
-
-    // -------------------------------------------------------------------------
-    // Bytes (Inline Uniform Data)
-    // -------------------------------------------------------------------------
-
-    pub fn setBytes(self: *Self, data: anytype, index: u32) *Self {
-        const T = @TypeOf(data);
-        if (@typeInfo(T) == .pointer) {
-            const Child = std.meta.Child(T);
-            mtl.MTLComputeCommandEncoderSetBytes(self.handle, @ptrCast(data), @sizeOf(Child), index);
-        } else {
-            mtl.MTLComputeCommandEncoderSetBytes(self.handle, @ptrCast(&data), @sizeOf(T), index);
-        }
-        return self;
-    }
-
-    // -------------------------------------------------------------------------
-    // Acceleration Structure Binding (for ray tracing)
-    // -------------------------------------------------------------------------
-
-    pub fn setAccelerationStructure(self: *Self, as: AccelerationStructure, index: u32) *Self {
-        mtl.MTLComputeCommandEncoderSetAccelerationStructure(self.handle, as.handle, index);
-        return self;
-    }
-
-    // -------------------------------------------------------------------------
-    // Threadgroup Memory
-    // -------------------------------------------------------------------------
-
-    pub fn setThreadgroupMemory(self: *Self, length: usize, index: u32) *Self {
-        mtl.MTLComputeCommandEncoderSetThreadgroupMemoryLength(self.handle, length, index);
-        return self;
-    }
-
-    // -------------------------------------------------------------------------
-    // Dispatch
-    // -------------------------------------------------------------------------
-
-    /// Full control dispatch
-    pub fn dispatch(self: *Self, groups: Size, threads_per_group: Size) *Self {
         mtl.MTLComputeCommandEncoderDispatchThreadgroups(
             self.handle,
             groups.toMtl(),
@@ -468,49 +460,86 @@ pub const ComputeEncoder = struct {
         return self;
     }
 
-    /// 1D dispatch - auto-calculates threadgroups based on pipeline
-    pub fn dispatch1d(self: *Self, count: usize) *Self {
-        const max_threads = self.current_pipeline.maxThreadsPerThreadgroup();
-        const threads: usize = @min(max_threads, 1024);
-        const groups = (count + threads - 1) / threads;
-        return self.dispatch(
-            .{ .width = groups },
-            .{ .width = threads },
-        );
-    }
+    // -------------------------------------------------------------------------
+    // Internal: Apply all bindings from options
+    // -------------------------------------------------------------------------
 
-    /// 2D dispatch - uses 16x16 threadgroups
-    pub fn dispatch2d(self: *Self, width: usize, height: usize) *Self {
-        const groups_x = (width + 15) / 16;
-        const groups_y = (height + 15) / 16;
-        return self.dispatch(
-            .{ .width = groups_x, .height = groups_y },
-            .{ .width = 16, .height = 16 },
-        );
-    }
+    fn applyBindings(self: *Self, pipeline: ComputePipeline, opts: anytype) void {
+        // Set pipeline if different
+        if (self.current_pipeline == null or self.current_pipeline.?.handle != pipeline.handle) {
+            mtl.MTLComputeCommandEncoderSetComputePipelineState(self.handle, pipeline.handle);
+            self.current_pipeline = pipeline;
+        }
 
-    /// 3D dispatch
-    pub fn dispatch3d(self: *Self, width: usize, height: usize, depth: usize) *Self {
-        const groups_x = (width + 7) / 8;
-        const groups_y = (height + 7) / 8;
-        const groups_z = (depth + 7) / 8;
-        return self.dispatch(
-            .{ .width = groups_x, .height = groups_y, .depth = groups_z },
-            .{ .width = 8, .height = 8, .depth = 8 },
-        );
-    }
+        const T = @TypeOf(opts);
+        const info = @typeInfo(T);
 
-    /// Indirect dispatch - GPU-driven workloads
-    pub fn dispatchIndirect(self: *Self, buf: anytype, offset: usize) *Self {
-        const handle = getHandle(buf);
-        const threads = self.current_pipeline.maxThreadsPerThreadgroup();
-        mtl.MTLComputeCommandEncoderDispatchThreadgroupsWithIndirectBuffer(
-            self.handle,
-            handle,
-            offset,
-            mtl.MTLSize{ .width = threads, .height = 1, .depth = 1 },
-        );
-        return self;
+        if (info != .@"struct") return;
+
+        // Apply buffer bindings
+        if (@hasField(T, "buffers")) {
+            const buffers = opts.buffers;
+            const buf_info = @typeInfo(@TypeOf(buffers));
+            if (buf_info == .@"struct" and buf_info.@"struct".is_tuple) {
+                inline for (buffers) |binding| {
+                    const buf_handle = getHandle(binding.buf);
+                    const offset = if (@hasField(@TypeOf(binding), "offset")) binding.offset else 0;
+                    mtl.MTLComputeCommandEncoderSetBuffer(self.handle, buf_handle, offset, binding.index);
+                }
+            }
+        }
+
+        // Apply bytes bindings
+        if (@hasField(T, "bytes")) {
+            const bytes = opts.bytes;
+            const bytes_info = @typeInfo(@TypeOf(bytes));
+            if (bytes_info == .@"struct" and bytes_info.@"struct".is_tuple) {
+                inline for (bytes) |binding| {
+                    const DataType = @TypeOf(binding.data);
+                    if (@typeInfo(DataType) == .pointer) {
+                        const Child = std.meta.Child(DataType);
+                        mtl.MTLComputeCommandEncoderSetBytes(self.handle, @ptrCast(binding.data), @sizeOf(Child), binding.index);
+                    } else {
+                        mtl.MTLComputeCommandEncoderSetBytes(self.handle, @ptrCast(&binding.data), @sizeOf(DataType), binding.index);
+                    }
+                }
+            }
+        }
+
+        // Apply texture bindings
+        if (@hasField(T, "textures")) {
+            const textures = opts.textures;
+            const tex_info = @typeInfo(@TypeOf(textures));
+            if (tex_info == .@"struct" and tex_info.@"struct".is_tuple) {
+                inline for (textures) |binding| {
+                    const tex_handle = if (@hasField(@TypeOf(binding.tex), "handle")) binding.tex.handle else binding.tex;
+                    mtl.MTLComputeCommandEncoderSetTexture(self.handle, tex_handle, binding.index);
+                }
+            }
+        }
+
+        // Apply threadgroup memory bindings
+        if (@hasField(T, "threadgroups")) {
+            const threadgroups = opts.threadgroups;
+            const tg_info = @typeInfo(@TypeOf(threadgroups));
+            if (tg_info == .@"struct" and tg_info.@"struct".is_tuple) {
+                inline for (threadgroups) |binding| {
+                    mtl.MTLComputeCommandEncoderSetThreadgroupMemoryLength(self.handle, binding.length, binding.index);
+                }
+            }
+        }
+
+        // Apply acceleration structure bindings
+        if (@hasField(T, "accels")) {
+            const accels = opts.accels;
+            const accel_info = @typeInfo(@TypeOf(accels));
+            if (accel_info == .@"struct" and accel_info.@"struct".is_tuple) {
+                inline for (accels) |binding| {
+                    const accel_handle = if (@hasField(@TypeOf(binding.accel), "handle")) binding.accel.handle else binding.accel;
+                    mtl.MTLComputeCommandEncoderSetAccelerationStructure(self.handle, accel_handle, binding.index);
+                }
+            }
+        }
     }
 
     // -------------------------------------------------------------------------
