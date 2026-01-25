@@ -39,7 +39,7 @@ pub const Device = struct {
     queue: mtl.MTLCommandQueueRef,
 
     /// Create device with system default GPU
-    pub fn default() Error!Device {
+    pub fn create() Error!Device {
         const handle = mtl.MTLWrapperCreateSystemDefaultDevice() orelse
             return error.DeviceNotFound;
         const queue = mtl.MTLDeviceNewCommandQueue(handle) orelse
@@ -71,7 +71,7 @@ pub const Device = struct {
     // Buffer Creation
     // -------------------------------------------------------------------------
 
-    pub fn buffer(self: Device, comptime T: type, count: usize, opts: BufferOptions) Error!Buffer(T) {
+    pub fn createBuffer(self: Device, comptime T: type, count: usize, opts: BufferOptions) Error!Buffer(T) {
         const size = count * @sizeOf(T);
         const resource_opts = opts.storage.toResourceOptions();
         const handle = mtl.MTLDeviceNewBufferWithLength(self.handle, size, resource_opts) orelse
@@ -85,20 +85,20 @@ pub const Device = struct {
     }
 
     /// Create buffer with default shared storage
-    pub fn bufferShared(self: Device, comptime T: type, count: usize) Error!Buffer(T) {
-        return self.buffer(T, count, .{});
+    pub fn createBufferShared(self: Device, comptime T: type, count: usize) Error!Buffer(T) {
+        return self.createBuffer(T, count, .{});
     }
 
     /// Create GPU-only buffer (best performance for intermediates)
-    pub fn bufferPrivate(self: Device, comptime T: type, count: usize) Error!Buffer(T) {
-        return self.buffer(T, count, .{ .storage = .private });
+    pub fn createBufferPrivate(self: Device, comptime T: type, count: usize) Error!Buffer(T) {
+        return self.createBuffer(T, count, .{ .storage = .private });
     }
 
     // -------------------------------------------------------------------------
     // Texture Creation
     // -------------------------------------------------------------------------
 
-    pub fn texture(self: Device, desc: TextureDescriptor) Error!Texture {
+    pub fn createTexture(self: Device, desc: TextureDescriptor) Error!Texture {
         const mtl_desc = mtl.MTLTextureDescriptorCreate();
         mtl.MTLTextureDescriptorSetTextureType(mtl_desc, @intFromEnum(desc.texture_type));
         mtl.MTLTextureDescriptorSetPixelFormat(mtl_desc, @intFromEnum(desc.pixel_format));
@@ -123,8 +123,8 @@ pub const Device = struct {
     }
 
     /// Convenience: create 2D texture
-    pub fn texture2d(self: Device, width: u32, height: u32, format: PixelFormat, usage: TextureUsage) Error!Texture {
-        return self.texture(.{
+    pub fn createTexture2d(self: Device, width: u32, height: u32, format: PixelFormat, usage: TextureUsage) Error!Texture {
+        return self.createTexture(.{
             .width = width,
             .height = height,
             .pixel_format = format,
@@ -136,7 +136,7 @@ pub const Device = struct {
     // Pipeline Creation
     // -------------------------------------------------------------------------
 
-    pub fn computePipeline(self: Device, desc: ComputePipelineDescriptor) Error!ComputePipeline {
+    pub fn createComputePipeline(self: Device, desc: ComputePipelineDescriptor) Error!ComputePipeline {
         // Compile library from source
         var compile_error: mtl.NSErrorRef = null;
         const library = mtl.MTLDeviceNewLibraryWithSource(
@@ -179,14 +179,14 @@ pub const Device = struct {
 
     /// Convenience: create pipeline from source and function name
     pub fn createPipeline(self: Device, source: [*:0]const u8, function: [*:0]const u8) Error!ComputePipeline {
-        return self.computePipeline(.{ .source = source, .function = function });
+        return self.createComputePipeline(.{ .source = source, .function = function });
     }
 
     // -------------------------------------------------------------------------
     // Acceleration Structures
     // -------------------------------------------------------------------------
 
-    pub fn accelerationStructure(self: Device, size: u64) Error!AccelerationStructure {
+    pub fn createAccelerationStructure(self: Device, size: u64) Error!AccelerationStructure {
         const handle = mtl.MTLDeviceNewAccelerationStructureWithSize(self.handle, size) orelse
             return error.AccelerationStructureCreationFailed;
         return .{ .handle = handle };
@@ -206,11 +206,11 @@ pub const Device = struct {
     // Events
     // -------------------------------------------------------------------------
 
-    pub fn event(self: Device) Event {
+    pub fn createEvent(self: Device) Event {
         return .{ .handle = mtl.MTLDeviceNewEvent(self.handle) };
     }
 
-    pub fn sharedEvent(self: Device) SharedEvent {
+    pub fn createSharedEvent(self: Device) SharedEvent {
         return .{ .handle = mtl.MTLDeviceNewSharedEvent(self.handle) };
     }
 
@@ -218,7 +218,7 @@ pub const Device = struct {
     // Command Buffer Creation
     // -------------------------------------------------------------------------
 
-    pub fn commandBuffer(self: Device) Error!CommandBuffer {
+    pub fn createCommandBuffer(self: Device) Error!CommandBuffer {
         const handle = mtl.MTLCommandQueueCommandBuffer(self.queue) orelse
             return error.CommandBufferCreationFailed;
         return .{
@@ -227,9 +227,9 @@ pub const Device = struct {
         };
     }
 
-    /// Alias for commandBuffer()
-    pub fn command(self: Device) Error!CommandBuffer {
-        return self.commandBuffer();
+    /// Alias for createCommandBuffer()
+    pub fn createCommand(self: Device) Error!CommandBuffer {
+        return self.createCommandBuffer();
     }
 
     // -------------------------------------------------------------------------
@@ -736,7 +736,7 @@ pub fn Buffer(comptime T: type) type {
         const Self = @This();
 
         /// Get CPU-accessible slice (null for private storage)
-        pub fn contents(self: Self) ?[]T {
+        pub fn getHostSlice(self: Self) ?[]T {
             if (self.storage == .private) return null;
             const ptr: [*]T = @ptrCast(@alignCast(mtl.MTLBufferContents(self.handle)));
             return ptr[0..self.len];

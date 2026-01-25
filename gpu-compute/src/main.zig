@@ -5,7 +5,7 @@ pub fn main() !void {
     std.debug.print("Metal Compute - New API Demo\n", .{});
     std.debug.print("============================\n\n", .{});
 
-    const device = try metal.Device.default();
+    const device = try metal.Device.create();
 
     if (device.name()) |n| {
         std.debug.print("Device: {s}\n", .{n});
@@ -31,20 +31,20 @@ pub fn main() !void {
     const pipeline = try device.createPipeline(shader_source, "vector_add");
     const count: usize = 1024;
 
-    var buf_a = try device.buffer(f32, count, .{});
-    var buf_b = try device.buffer(f32, count, .{});
-    var buf_c = try device.buffer(f32, count, .{});
+    var buf_a = try device.createBuffer(f32, count, .{});
+    var buf_b = try device.createBuffer(f32, count, .{});
+    var buf_c = try device.createBuffer(f32, count, .{});
 
     // Initialize
-    const a = buf_a.contents().?;
-    const b = buf_b.contents().?;
+    const a = buf_a.getHostSlice().?;
+    const b = buf_b.getHostSlice().?;
     for (0..count) |i| {
         a[i] = @floatFromInt(i);
         b[i] = @floatFromInt(i * 2);
     }
 
     // Execute using new API
-    var cmd = try device.command();
+    var cmd = try device.createCommand();
     {
         var enc = cmd.computeEncoder(pipeline, .{});
         defer enc.end();
@@ -55,7 +55,7 @@ pub fn main() !void {
     device.submit(&cmd);
 
     // Verify
-    const c = buf_c.contents().?;
+    const c = buf_c.getHostSlice().?;
     var correct: usize = 0;
     for (0..count) |i| {
         const expected = a[i] + b[i];
@@ -83,12 +83,12 @@ test "basic_compute" {
 
     const count: usize = 16_000_000;
 
-    const device = try metal.Device.default();
+    const device = try metal.Device.create();
     const pipeline = try device.createPipeline(shader_source, "fill_42");
-    const buf = try device.buffer(f32, count, .{});
+    const buf = try device.createBuffer(f32, count, .{});
 
     // New API: scope-based encoder
-    var cmd = try device.command();
+    var cmd = try device.createCommand();
     {
         var enc = cmd.computeEncoder(pipeline, .{});
         defer enc.end();
@@ -99,7 +99,7 @@ test "basic_compute" {
     device.submit(&cmd);
 
     // Verify
-    const output = buf.contents().?;
+    const output = buf.getHostSlice().?;
     for (output) |val| {
         try std.testing.expectEqual(@as(f32, 42.0), val);
     }
@@ -120,11 +120,11 @@ test "async_submission" {
 
     const count: usize = 16_000_000;
 
-    const device = try metal.Device.default();
+    const device = try metal.Device.create();
     const pipeline = try device.createPipeline(shader_source, "fill_42");
-    const buf = try device.buffer(f32, count, .{});
+    const buf = try device.createBuffer(f32, count, .{});
 
-    var cmd = try device.command();
+    var cmd = try device.createCommand();
     {
         var enc = cmd.computeEncoder(pipeline, .{});
         defer enc.end();
@@ -141,7 +141,7 @@ test "async_submission" {
     fence.wait();
 
     // Verify
-    const output = buf.contents().?;
+    const output = buf.getHostSlice().?;
     for (output) |val| {
         try std.testing.expectEqual(@as(f32, 42.0), val);
     }
@@ -169,18 +169,18 @@ test "pipeline_switching" {
 
     const count: usize = 1024;
 
-    const device = try metal.Device.default();
+    const device = try metal.Device.create();
     const double_pipeline = try device.createPipeline(shader_source, "double_it");
     const add_pipeline = try device.createPipeline(shader_source, "add_ten");
-    var buf = try device.buffer(f32, count, .{});
+    var buf = try device.createBuffer(f32, count, .{});
 
     // Initialize with 1.0
-    const data = buf.contents().?;
+    const data = buf.getHostSlice().?;
     for (data) |*val| val.* = 1.0;
 
     // Single encoder, switch pipelines (cheap!)
     // 1.0 -> double -> 2.0 -> add_ten -> 12.0
-    var cmd = try device.command();
+    var cmd = try device.createCommand();
     {
         var enc = cmd.computeEncoder(double_pipeline, .{});
         defer enc.end();
@@ -216,12 +216,12 @@ test "multi_encoder_command_buffer" {
 
     const count: usize = 1024;
 
-    const device = try metal.Device.default();
+    const device = try metal.Device.create();
     const pipeline = try device.createPipeline(shader_source, "fill_42");
-    const src_buf = try device.buffer(f32, count, .{});
-    const dst_buf = try device.buffer(f32, count, .{});
+    const src_buf = try device.createBuffer(f32, count, .{});
+    const dst_buf = try device.createBuffer(f32, count, .{});
 
-    var cmd = try device.command();
+    var cmd = try device.createCommand();
 
     // Compute pass: fill src with 42
     {
@@ -243,7 +243,7 @@ test "multi_encoder_command_buffer" {
     device.submit(&cmd);
 
     // Verify dst has 42.0
-    const output = dst_buf.contents().?;
+    const output = dst_buf.getHostSlice().?;
     for (output) |val| {
         try std.testing.expectEqual(@as(f32, 42.0), val);
     }
@@ -273,15 +273,15 @@ test "bytes_uniform_data" {
         offset: u32,
     };
 
-    const device = try metal.Device.default();
+    const device = try metal.Device.create();
     const pipeline = try device.createPipeline(shader_source, "scale_kernel");
-    var buf = try device.buffer(f32, 8, .{});
+    var buf = try device.createBuffer(f32, 8, .{});
 
     // Initialize
-    const data = buf.contents().?;
+    const data = buf.getHostSlice().?;
     for (data, 0..) |*v, i| v.* = @floatFromInt(i + 1);
 
-    var cmd = try device.command();
+    var cmd = try device.createCommand();
     {
         var enc = cmd.computeEncoder(pipeline, .{});
         defer enc.end();
@@ -299,22 +299,22 @@ test "bytes_uniform_data" {
 }
 
 test "storage_modes" {
-    const device = try metal.Device.default();
+    const device = try metal.Device.create();
 
     // Shared - CPU accessible
-    const shared_buf = try device.buffer(f32, 4, .{ .storage = .shared });
-    try std.testing.expect(shared_buf.contents() != null);
+    const shared_buf = try device.createBuffer(f32, 4, .{ .storage = .shared });
+    try std.testing.expect(shared_buf.getHostSlice() != null);
 
     // Private - GPU only
-    const private_buf = try device.buffer(f32, 4, .{ .storage = .private });
-    try std.testing.expect(private_buf.contents() == null);
+    const private_buf = try device.createBuffer(f32, 4, .{ .storage = .private });
+    try std.testing.expect(private_buf.getHostSlice() == null);
 
     // Convenience methods
-    const shared2 = try device.bufferShared(f32, 4);
-    try std.testing.expect(shared2.contents() != null);
+    const shared2 = try device.createBufferShared(f32, 4);
+    try std.testing.expect(shared2.getHostSlice() != null);
 
-    const private2 = try device.bufferPrivate(f32, 4);
-    try std.testing.expect(private2.contents() == null);
+    const private2 = try device.createBufferPrivate(f32, 4);
+    try std.testing.expect(private2.getHostSlice() == null);
 }
 
 test "concurrent_dispatch_with_barrier" {
@@ -341,14 +341,14 @@ test "concurrent_dispatch_with_barrier" {
         offset: u32,
     };
 
-    const device = try metal.Device.default();
+    const device = try metal.Device.create();
     const pipeline = try device.createPipeline(shader_source, "scale_kernel");
-    var buf = try device.buffer(f32, 8, .{});
+    var buf = try device.createBuffer(f32, 8, .{});
 
-    const data = buf.contents().?;
+    const data = buf.getHostSlice().?;
     for (data, 0..) |*v, i| v.* = @floatFromInt(i + 1);
 
-    var cmd = try device.command();
+    var cmd = try device.createCommand();
     {
         // Concurrent dispatch mode
         var enc = cmd.computeEncoder(pipeline, .{ .concurrent = true });
@@ -375,7 +375,7 @@ test "concurrent_dispatch_with_barrier" {
 }
 
 test "acceleration_structure" {
-    const device = try metal.Device.default();
+    const device = try metal.Device.create();
 
     if (!device.supportsRaytracing()) {
         return; // Skip on devices without ray tracing
@@ -388,13 +388,13 @@ test "acceleration_structure" {
         0.5, 1.0, 0.0, // v2
     };
 
-    var vertex_buf = try device.buffer(f32, vertices.len, .{});
-    @memcpy(vertex_buf.contents().?, &vertices);
+    var vertex_buf = try device.createBuffer(f32, vertices.len, .{});
+    @memcpy(vertex_buf.getHostSlice().?, &vertices);
 
     // Create index buffer
     const indices = [_]u32{ 0, 1, 2 };
-    var index_buf = try device.buffer(u32, indices.len, .{});
-    @memcpy(index_buf.contents().?, &indices);
+    var index_buf = try device.createBuffer(u32, indices.len, .{});
+    @memcpy(index_buf.getHostSlice().?, &indices);
 
     // Triangle geometry descriptor (fluent API)
     const triangle_geo = metal.TriangleGeometryDescriptor.init()
@@ -411,11 +411,11 @@ test "acceleration_structure" {
     const sizes = device.accelSizes(blas_desc);
     try std.testing.expect(sizes.acceleration_structure_size > 0);
 
-    const blas = try device.accelerationStructure(sizes.acceleration_structure_size);
-    const scratch = try device.buffer(u8, sizes.build_scratch_buffer_size, .{});
+    const blas = try device.createAccelerationStructure(sizes.acceleration_structure_size);
+    const scratch = try device.createBuffer(u8, sizes.build_scratch_buffer_size, .{});
 
     // Build using accel encoder
-    var cmd = try device.command();
+    var cmd = try device.createCommand();
     {
         var enc = cmd.accelEncoder();
         defer enc.end();
@@ -443,14 +443,14 @@ test "texture_2d" {
         \\}
     ;
 
-    const device = try metal.Device.default();
+    const device = try metal.Device.create();
     const pipeline = try device.createPipeline(shader_source, "invert");
 
     const width: u32 = 64;
     const height: u32 = 64;
 
-    const input_tex = try device.texture2d(width, height, .rgba8unorm, .{ .read = true });
-    const output_tex = try device.texture2d(width, height, .rgba8unorm, .{ .write = true });
+    const input_tex = try device.createTexture2d(width, height, .rgba8unorm, .{ .read = true });
+    const output_tex = try device.createTexture2d(width, height, .rgba8unorm, .{ .write = true });
 
     // Create test pattern (white)
     var pixels: [width * height * 4]u8 = undefined;
@@ -462,7 +462,7 @@ test "texture_2d" {
     }
     input_tex.upload(&pixels);
 
-    var cmd = try device.command();
+    var cmd = try device.createCommand();
     {
         var enc = cmd.computeEncoder(pipeline, .{});
         defer enc.end();
@@ -500,21 +500,21 @@ test "buffers_convenience" {
 
     const count: usize = 1024;
 
-    const device = try metal.Device.default();
+    const device = try metal.Device.create();
     const pipeline = try device.createPipeline(shader_source, "vector_add");
 
-    var buf_a = try device.buffer(f32, count, .{});
-    var buf_b = try device.buffer(f32, count, .{});
-    var buf_c = try device.buffer(f32, count, .{});
+    var buf_a = try device.createBuffer(f32, count, .{});
+    var buf_b = try device.createBuffer(f32, count, .{});
+    var buf_c = try device.createBuffer(f32, count, .{});
 
-    const a = buf_a.contents().?;
-    const b = buf_b.contents().?;
+    const a = buf_a.getHostSlice().?;
+    const b = buf_b.getHostSlice().?;
     for (0..count) |i| {
         a[i] = @floatFromInt(i);
         b[i] = @floatFromInt(i * 2);
     }
 
-    var cmd = try device.command();
+    var cmd = try device.createCommand();
     {
         var enc = cmd.computeEncoder(pipeline, .{});
         defer enc.end();
@@ -525,7 +525,7 @@ test "buffers_convenience" {
     }
     device.submit(&cmd);
 
-    const c = buf_c.contents().?;
+    const c = buf_c.getHostSlice().?;
     for (0..count) |i| {
         const expected = a[i] + b[i];
         try std.testing.expectApproxEqAbs(expected, c[i], 0.001);
