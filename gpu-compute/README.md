@@ -39,11 +39,11 @@ var cmd = try device.command();
     var enc = cmd.computeEncoder(pipelineA, .{});
     defer enc.end();
 
-    enc.buffer(..., 0);
-    enc.dispatch1d(...);      // runs pipeline A
-    enc.pipeline(pipelineB);  // switch pipeline (cheap!)
-    enc.buffer(..., 0);
-    enc.dispatch1d(...);      // runs pipeline B
+    enc.setBuffer(..., 0);
+    enc.dispatch1d(...);         // runs pipeline A
+    enc.setPipeline(pipelineB);  // switch pipeline (cheap!)
+    enc.setBuffer(..., 0);
+    enc.dispatch1d(...);         // runs pipeline B
 }
 ```
 

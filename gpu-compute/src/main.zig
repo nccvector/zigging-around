@@ -49,7 +49,7 @@ pub fn main() !void {
         var enc = cmd.computeEncoder(pipeline, .{});
         defer enc.end();
 
-        enc.buffers(.{ buf_a, buf_b, buf_c });
+        enc.setBuffers(.{ buf_a, buf_b, buf_c });
         enc.dispatch1d(count);
     }
     device.submit(&cmd);
@@ -93,7 +93,7 @@ test "basic_compute" {
         var enc = cmd.computeEncoder(pipeline, .{});
         defer enc.end();
 
-        enc.buffer(buf, 0);
+        enc.setBuffer(buf, 0);
         enc.dispatch1d(count);
     }
     device.submit(&cmd);
@@ -129,7 +129,7 @@ test "async_submission" {
         var enc = cmd.computeEncoder(pipeline, .{});
         defer enc.end();
 
-        enc.buffer(buf, 0);
+        enc.setBuffer(buf, 0);
         enc.dispatch1d(count);
     }
 
@@ -185,12 +185,12 @@ test "pipeline_switching" {
         var enc = cmd.computeEncoder(double_pipeline, .{});
         defer enc.end();
 
-        enc.buffer(buf, 0);
+        enc.setBuffer(buf, 0);
         enc.dispatch1d(count);
 
         // Switch pipeline (same encoder, cheap!)
-        enc.pipeline(add_pipeline);
-        enc.buffer(buf, 0);
+        enc.setPipeline(add_pipeline);
+        enc.setBuffer(buf, 0);
         enc.dispatch1d(count);
     }
     device.submit(&cmd);
@@ -228,7 +228,7 @@ test "multi_encoder_command_buffer" {
         var enc = cmd.computeEncoder(pipeline, .{});
         defer enc.end();
 
-        enc.buffer(src_buf, 0);
+        enc.setBuffer(src_buf, 0);
         enc.dispatch1d(count);
     }
 
@@ -286,8 +286,8 @@ test "bytes_uniform_data" {
         var enc = cmd.computeEncoder(pipeline, .{});
         defer enc.end();
 
-        enc.buffer(buf, 0);
-        enc.bytes(Params{ .scale = 2.0, .offset = 0 }, 1);
+        enc.setBuffer(buf, 0);
+        enc.setBytes(Params{ .scale = 2.0, .offset = 0 }, 1);
         enc.dispatch1d(8);
     }
     device.submit(&cmd);
@@ -355,15 +355,15 @@ test "concurrent_dispatch_with_barrier" {
         defer enc.end();
 
         // x2
-        enc.buffer(buf, 0);
-        enc.bytes(Params{ .scale = 2.0, .offset = 0 }, 1);
+        enc.setBuffer(buf, 0);
+        enc.setBytes(Params{ .scale = 2.0, .offset = 0 }, 1);
         enc.dispatch1d(8);
 
         // Barrier required for concurrent when same buffer
         enc.barrier(.buffers);
 
         // x3
-        enc.bytes(Params{ .scale = 3.0, .offset = 0 }, 1);
+        enc.setBytes(Params{ .scale = 3.0, .offset = 0 }, 1);
         enc.dispatch1d(8);
     }
     device.submit(&cmd);
@@ -467,7 +467,7 @@ test "texture_2d" {
         var enc = cmd.computeEncoder(pipeline, .{});
         defer enc.end();
 
-        enc.textures(.{ input_tex, output_tex });
+        enc.setTextures(.{ input_tex, output_tex });
         enc.dispatch2d(width, height);
     }
     device.submit(&cmd);
@@ -520,7 +520,7 @@ test "buffers_convenience" {
         defer enc.end();
 
         // Convenience: bind multiple buffers at once
-        enc.buffers(.{ buf_a, buf_b, buf_c });
+        enc.setBuffers(.{ buf_a, buf_b, buf_c });
         enc.dispatch1d(count);
     }
     device.submit(&cmd);

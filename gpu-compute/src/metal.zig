@@ -359,7 +359,7 @@ pub const ComputeEncoder = struct {
     // -------------------------------------------------------------------------
 
     /// Switch pipeline (cheap within same encoder!)
-    pub fn pipeline(self: *ComputeEncoder, p: ComputePipeline) void {
+    pub fn setPipeline(self: *ComputeEncoder, p: ComputePipeline) void {
         mtl.MTLComputeCommandEncoderSetComputePipelineState(self.handle, p.handle);
         self.current_pipeline = p;
     }
@@ -369,22 +369,22 @@ pub const ComputeEncoder = struct {
     // -------------------------------------------------------------------------
 
     /// Bind single buffer at index
-    pub fn buffer(self: *ComputeEncoder, buf: anytype, index: u32) void {
-        self.bufferOffset(buf, index, 0);
+    pub fn setBuffer(self: *ComputeEncoder, buf: anytype, index: u32) void {
+        self.setBufferOffset(buf, index, 0);
     }
 
     /// Bind single buffer at index with offset
-    pub fn bufferOffset(self: *ComputeEncoder, buf: anytype, index: u32, offset: usize) void {
+    pub fn setBufferOffset(self: *ComputeEncoder, buf: anytype, index: u32, offset: usize) void {
         const handle = getHandle(buf);
         mtl.MTLComputeCommandEncoderSetBuffer(self.handle, handle, offset, index);
     }
 
     /// Bind multiple buffers starting at index 0
-    pub fn buffers(self: *ComputeEncoder, bufs: anytype) void {
+    pub fn setBuffers(self: *ComputeEncoder, bufs: anytype) void {
         const info = @typeInfo(@TypeOf(bufs));
         if (info == .@"struct" and info.@"struct".is_tuple) {
             inline for (bufs, 0..) |b, i| {
-                self.buffer(b, @intCast(i));
+                self.setBuffer(b, @intCast(i));
             }
         }
     }
@@ -393,15 +393,15 @@ pub const ComputeEncoder = struct {
     // Texture Binding
     // -------------------------------------------------------------------------
 
-    pub fn texture(self: *ComputeEncoder, tex: Texture, index: u32) void {
+    pub fn setTexture(self: *ComputeEncoder, tex: Texture, index: u32) void {
         mtl.MTLComputeCommandEncoderSetTexture(self.handle, tex.handle, index);
     }
 
-    pub fn textures(self: *ComputeEncoder, texs: anytype) void {
+    pub fn setTextures(self: *ComputeEncoder, texs: anytype) void {
         const info = @typeInfo(@TypeOf(texs));
         if (info == .@"struct" and info.@"struct".is_tuple) {
             inline for (texs, 0..) |t, i| {
-                self.texture(t, @intCast(i));
+                self.setTexture(t, @intCast(i));
             }
         }
     }
@@ -410,7 +410,7 @@ pub const ComputeEncoder = struct {
     // Bytes (Inline Uniform Data)
     // -------------------------------------------------------------------------
 
-    pub fn bytes(self: *ComputeEncoder, data: anytype, index: u32) void {
+    pub fn setBytes(self: *ComputeEncoder, data: anytype, index: u32) void {
         const T = @TypeOf(data);
         if (@typeInfo(T) == .pointer) {
             const Child = std.meta.Child(T);
@@ -424,7 +424,7 @@ pub const ComputeEncoder = struct {
     // Acceleration Structure Binding (for ray tracing)
     // -------------------------------------------------------------------------
 
-    pub fn accel(self: *ComputeEncoder, as: AccelerationStructure, index: u32) void {
+    pub fn setAccelerationStructure(self: *ComputeEncoder, as: AccelerationStructure, index: u32) void {
         mtl.MTLComputeCommandEncoderSetAccelerationStructure(self.handle, as.handle, index);
     }
 
@@ -432,7 +432,7 @@ pub const ComputeEncoder = struct {
     // Threadgroup Memory
     // -------------------------------------------------------------------------
 
-    pub fn threadgroupMemory(self: *ComputeEncoder, length: usize, index: u32) void {
+    pub fn setThreadgroupMemory(self: *ComputeEncoder, length: usize, index: u32) void {
         mtl.MTLComputeCommandEncoderSetThreadgroupMemoryLength(self.handle, length, index);
     }
 
