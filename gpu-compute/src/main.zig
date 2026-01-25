@@ -46,11 +46,10 @@ pub fn main() !void {
     // Execute using new API
     var cmd = try device.createCommand();
     {
-        var enc = cmd.computeEncoder(pipeline, .{});
-        defer enc.end();
-
-        enc.setBuffers(.{ buf_a, buf_b, buf_c });
-        enc.dispatch1d(count);
+        cmd.createComputeEncoder(pipeline, .{})
+            .setBuffers(.{ buf_a, buf_b, buf_c })
+            .dispatch1d(count)
+            .end();
     }
     device.submit(&cmd);
 
@@ -90,11 +89,10 @@ test "basic_compute" {
     // New API: scope-based encoder
     var cmd = try device.createCommand();
     {
-        var enc = cmd.computeEncoder(pipeline, .{});
-        defer enc.end();
-
-        enc.setBuffer(buf, 0);
-        enc.dispatch1d(count);
+        cmd.createComputeEncoder(pipeline, .{})
+            .setBuffer(buf, 0)
+            .dispatch1d(count)
+            .end();
     }
     device.submit(&cmd);
 
@@ -126,11 +124,10 @@ test "async_submission" {
 
     var cmd = try device.createCommand();
     {
-        var enc = cmd.computeEncoder(pipeline, .{});
-        defer enc.end();
-
-        enc.setBuffer(buf, 0);
-        enc.dispatch1d(count);
+        cmd.createComputeEncoder(pipeline, .{})
+            .setBuffer(buf, 0)
+            .dispatch1d(count)
+            .end();
     }
 
     // Async submission
@@ -182,16 +179,14 @@ test "pipeline_switching" {
     // 1.0 -> double -> 2.0 -> add_ten -> 12.0
     var cmd = try device.createCommand();
     {
-        var enc = cmd.computeEncoder(double_pipeline, .{});
-        defer enc.end();
-
-        enc.setBuffer(buf, 0);
-        enc.dispatch1d(count);
-
-        // Switch pipeline (same encoder, cheap!)
-        enc.setPipeline(add_pipeline);
-        enc.setBuffer(buf, 0);
-        enc.dispatch1d(count);
+        cmd.createComputeEncoder(double_pipeline, .{})
+            .setBuffer(buf, 0)
+            .dispatch1d(count)
+            // Switch pipeline (same encoder, cheap!)
+            .setPipeline(add_pipeline)
+            .setBuffer(buf, 0)
+            .dispatch1d(count)
+            .end();
     }
     device.submit(&cmd);
 
@@ -225,19 +220,17 @@ test "multi_encoder_command_buffer" {
 
     // Compute pass: fill src with 42
     {
-        var enc = cmd.computeEncoder(pipeline, .{});
-        defer enc.end();
-
-        enc.setBuffer(src_buf, 0);
-        enc.dispatch1d(count);
+        cmd.createComputeEncoder(pipeline, .{})
+            .setBuffer(src_buf, 0)
+            .dispatch1d(count)
+            .end();
     }
 
     // Blit pass: copy src to dst
     {
-        var enc = cmd.blitEncoder();
-        defer enc.end();
-
-        enc.copy(src_buf, dst_buf);
+        cmd.createBlitEncoder()
+            .copy(src_buf, dst_buf)
+            .end();
     }
 
     device.submit(&cmd);
@@ -283,12 +276,11 @@ test "bytes_uniform_data" {
 
     var cmd = try device.createCommand();
     {
-        var enc = cmd.computeEncoder(pipeline, .{});
-        defer enc.end();
-
-        enc.setBuffer(buf, 0);
-        enc.setBytes(Params{ .scale = 2.0, .offset = 0 }, 1);
-        enc.dispatch1d(8);
+        cmd.createComputeEncoder(pipeline, .{})
+            .setBuffer(buf, 0)
+            .setBytes(Params{ .scale = 2.0, .offset = 0 }, 1)
+            .dispatch1d(8)
+            .end();
     }
     device.submit(&cmd);
 
@@ -351,20 +343,17 @@ test "concurrent_dispatch_with_barrier" {
     var cmd = try device.createCommand();
     {
         // Concurrent dispatch mode
-        var enc = cmd.computeEncoder(pipeline, .{ .concurrent = true });
-        defer enc.end();
-
-        // x2
-        enc.setBuffer(buf, 0);
-        enc.setBytes(Params{ .scale = 2.0, .offset = 0 }, 1);
-        enc.dispatch1d(8);
-
-        // Barrier required for concurrent when same buffer
-        enc.barrier(.buffers);
-
-        // x3
-        enc.setBytes(Params{ .scale = 3.0, .offset = 0 }, 1);
-        enc.dispatch1d(8);
+        cmd.createComputeEncoder(pipeline, .{ .concurrent = true })
+            // x2
+            .setBuffer(buf, 0)
+            .setBytes(Params{ .scale = 2.0, .offset = 0 }, 1)
+            .dispatch1d(8)
+            // Barrier required for concurrent when same buffer
+            .barrier(.buffers)
+            // x3
+            .setBytes(Params{ .scale = 3.0, .offset = 0 }, 1)
+            .dispatch1d(8)
+            .end();
     }
     device.submit(&cmd);
 
@@ -417,10 +406,9 @@ test "acceleration_structure" {
     // Build using accel encoder
     var cmd = try device.createCommand();
     {
-        var enc = cmd.accelEncoder();
-        defer enc.end();
-
-        enc.build(blas, blas_desc, scratch);
+        cmd.createAccelEncoder()
+            .build(blas, blas_desc, scratch)
+            .end();
     }
     device.submit(&cmd);
 
@@ -464,11 +452,10 @@ test "texture_2d" {
 
     var cmd = try device.createCommand();
     {
-        var enc = cmd.computeEncoder(pipeline, .{});
-        defer enc.end();
-
-        enc.setTextures(.{ input_tex, output_tex });
-        enc.dispatch2d(width, height);
+        cmd.createComputeEncoder(pipeline, .{})
+            .setTextures(.{ input_tex, output_tex })
+            .dispatch2d(width, height)
+            .end();
     }
     device.submit(&cmd);
 
@@ -516,12 +503,11 @@ test "buffers_convenience" {
 
     var cmd = try device.createCommand();
     {
-        var enc = cmd.computeEncoder(pipeline, .{});
-        defer enc.end();
-
-        // Convenience: bind multiple buffers at once
-        enc.setBuffers(.{ buf_a, buf_b, buf_c });
-        enc.dispatch1d(count);
+        cmd.createComputeEncoder(pipeline, .{})
+            // Convenience: bind multiple buffers at once
+            .setBuffers(.{ buf_a, buf_b, buf_c })
+            .dispatch1d(count)
+            .end();
     }
     device.submit(&cmd);
 

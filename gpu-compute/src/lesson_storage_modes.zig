@@ -33,19 +33,19 @@ pub fn main() !void {
     var cmd = try device.createCommand();
     {
         // Copy data host -> device
-        var blit_enc = cmd.blitEncoder();
-        blit_enc.copy(shared, private);
-        blit_enc.end();
+        cmd.createBlitEncoder()
+            .copy(shared, private)
+            .end();
 
-        var comp_enc = cmd.computeEncoder(pipeline, .{});
-        comp_enc.setBuffer(private, 0);
-        comp_enc.dispatch1d(COUNT);
-        comp_enc.end();
+        cmd.createComputeEncoder(pipeline, .{})
+            .setBuffer(private, 0)
+            .dispatch1d(COUNT)
+            .end();
 
         // Copy data device -> host
-        var blit_enc2 = cmd.blitEncoder();
-        blit_enc2.copy(private, shared);
-        blit_enc2.end();
+        cmd.createBlitEncoder()
+            .copy(private, shared)
+            .end();
     }
 
     device.submit(&cmd);

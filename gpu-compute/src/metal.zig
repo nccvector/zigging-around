@@ -261,6 +261,11 @@ pub const CommandBuffer = struct {
     handle: mtl.MTLCommandBufferRef,
     current_encoder: ?EncoderHandle,
 
+    // Storage for encoders so we can return pointers for chaining
+    compute_encoder: ComputeEncoder = undefined,
+    blit_encoder: BlitEncoder = undefined,
+    accel_encoder: AccelEncoder = undefined,
+
     const EncoderHandle = union(enum) {
         compute: mtl.MTLComputeCommandEncoderRef,
         blit: mtl.MTLBlitCommandEncoderRef,
@@ -284,7 +289,7 @@ pub const CommandBuffer = struct {
     // Encoder Creation
     // -------------------------------------------------------------------------
 
-    pub fn computeEncoder(self: *CommandBuffer, pipeline: ComputePipeline, opts: ComputeEncoderOptions) ComputeEncoder {
+    pub fn createComputeEncoder(self: *CommandBuffer, pipeline: ComputePipeline, opts: ComputeEncoderOptions) *ComputeEncoder {
         self.endCurrentEncoder();
 
         const enc = if (opts.concurrent)
@@ -297,35 +302,38 @@ pub const CommandBuffer = struct {
         // Set initial pipeline
         mtl.MTLComputeCommandEncoderSetComputePipelineState(enc, pipeline.handle);
 
-        return .{
+        self.compute_encoder = .{
             .handle = enc,
             .cmd = self,
             .current_pipeline = pipeline,
         };
+        return &self.compute_encoder;
     }
 
-    pub fn blitEncoder(self: *CommandBuffer) BlitEncoder {
+    pub fn createBlitEncoder(self: *CommandBuffer) *BlitEncoder {
         self.endCurrentEncoder();
 
         const enc = mtl.MTLCommandBufferBlitCommandEncoder(self.handle);
         self.current_encoder = .{ .blit = enc };
 
-        return .{
+        self.blit_encoder = .{
             .handle = enc,
             .cmd = self,
         };
+        return &self.blit_encoder;
     }
 
-    pub fn accelEncoder(self: *CommandBuffer) AccelEncoder {
+    pub fn createAccelEncoder(self: *CommandBuffer) *AccelEncoder {
         self.endCurrentEncoder();
 
         const enc = mtl.MTLCommandBufferAccelerationStructureCommandEncoder(self.handle);
         self.current_encoder = .{ .accel = enc };
 
-        return .{
+        self.accel_encoder = .{
             .handle = enc,
             .cmd = self,
         };
+        return &self.accel_encoder;
     }
 
     // -------------------------------------------------------------------------
@@ -354,14 +362,17 @@ pub const ComputeEncoder = struct {
     cmd: *CommandBuffer,
     current_pipeline: ComputePipeline,
 
+    const Self = @This();
+
     // -------------------------------------------------------------------------
     // Pipeline
     // -------------------------------------------------------------------------
 
     /// Switch pipeline (cheap within same encoder!)
-    pub fn setPipeline(self: *ComputeEncoder, p: ComputePipeline) void {
+    pub fn setPipeline(self: *Self, p: ComputePipeline) *Self {
         mtl.MTLComputeCommandEncoderSetComputePipelineState(self.handle, p.handle);
         self.current_pipeline = p;
+        return self;
     }
 
     // -------------------------------------------------------------------------
@@ -369,48 +380,52 @@ pub const ComputeEncoder = struct {
     // -------------------------------------------------------------------------
 
     /// Bind single buffer at index
-    pub fn setBuffer(self: *ComputeEncoder, buf: anytype, index: u32) void {
-        self.setBufferOffset(buf, index, 0);
+    pub fn setBuffer(self: *Self, buf: anytype, index: u32) *Self {
+        return self.setBufferOffset(buf, index, 0);
     }
 
     /// Bind single buffer at index with offset
-    pub fn setBufferOffset(self: *ComputeEncoder, buf: anytype, index: u32, offset: usize) void {
+    pub fn setBufferOffset(self: *Self, buf: anytype, index: u32, offset: usize) *Self {
         const handle = getHandle(buf);
         mtl.MTLComputeCommandEncoderSetBuffer(self.handle, handle, offset, index);
+        return self;
     }
 
     /// Bind multiple buffers starting at index 0
-    pub fn setBuffers(self: *ComputeEncoder, bufs: anytype) void {
+    pub fn setBuffers(self: *Self, bufs: anytype) *Self {
         const info = @typeInfo(@TypeOf(bufs));
         if (info == .@"struct" and info.@"struct".is_tuple) {
             inline for (bufs, 0..) |b, i| {
-                self.setBuffer(b, @intCast(i));
+                _ = self.setBuffer(b, @intCast(i));
             }
         }
+        return self;
     }
 
     // -------------------------------------------------------------------------
     // Texture Binding
     // -------------------------------------------------------------------------
 
-    pub fn setTexture(self: *ComputeEncoder, tex: Texture, index: u32) void {
+    pub fn setTexture(self: *Self, tex: Texture, index: u32) *Self {
         mtl.MTLComputeCommandEncoderSetTexture(self.handle, tex.handle, index);
+        return self;
     }
 
-    pub fn setTextures(self: *ComputeEncoder, texs: anytype) void {
+    pub fn setTextures(self: *Self, texs: anytype) *Self {
         const info = @typeInfo(@TypeOf(texs));
         if (info == .@"struct" and info.@"struct".is_tuple) {
             inline for (texs, 0..) |t, i| {
-                self.setTexture(t, @intCast(i));
+                _ = self.setTexture(t, @intCast(i));
             }
         }
+        return self;
     }
 
     // -------------------------------------------------------------------------
     // Bytes (Inline Uniform Data)
     // -------------------------------------------------------------------------
 
-    pub fn setBytes(self: *ComputeEncoder, data: anytype, index: u32) void {
+    pub fn setBytes(self: *Self, data: anytype, index: u32) *Self {
         const T = @TypeOf(data);
         if (@typeInfo(T) == .pointer) {
             const Child = std.meta.Child(T);
@@ -418,22 +433,25 @@ pub const ComputeEncoder = struct {
         } else {
             mtl.MTLComputeCommandEncoderSetBytes(self.handle, @ptrCast(&data), @sizeOf(T), index);
         }
+        return self;
     }
 
     // -------------------------------------------------------------------------
     // Acceleration Structure Binding (for ray tracing)
     // -------------------------------------------------------------------------
 
-    pub fn setAccelerationStructure(self: *ComputeEncoder, as: AccelerationStructure, index: u32) void {
+    pub fn setAccelerationStructure(self: *Self, as: AccelerationStructure, index: u32) *Self {
         mtl.MTLComputeCommandEncoderSetAccelerationStructure(self.handle, as.handle, index);
+        return self;
     }
 
     // -------------------------------------------------------------------------
     // Threadgroup Memory
     // -------------------------------------------------------------------------
 
-    pub fn setThreadgroupMemory(self: *ComputeEncoder, length: usize, index: u32) void {
+    pub fn setThreadgroupMemory(self: *Self, length: usize, index: u32) *Self {
         mtl.MTLComputeCommandEncoderSetThreadgroupMemoryLength(self.handle, length, index);
+        return self;
     }
 
     // -------------------------------------------------------------------------
@@ -441,48 +459,49 @@ pub const ComputeEncoder = struct {
     // -------------------------------------------------------------------------
 
     /// Full control dispatch
-    pub fn dispatch(self: *ComputeEncoder, groups: Size, threads_per_group: Size) void {
+    pub fn dispatch(self: *Self, groups: Size, threads_per_group: Size) *Self {
         mtl.MTLComputeCommandEncoderDispatchThreadgroups(
             self.handle,
             groups.toMtl(),
             threads_per_group.toMtl(),
         );
+        return self;
     }
 
     /// 1D dispatch - auto-calculates threadgroups based on pipeline
-    pub fn dispatch1d(self: *ComputeEncoder, count: usize) void {
+    pub fn dispatch1d(self: *Self, count: usize) *Self {
         const max_threads = self.current_pipeline.maxThreadsPerThreadgroup();
         const threads: usize = @min(max_threads, 1024);
         const groups = (count + threads - 1) / threads;
-        self.dispatch(
+        return self.dispatch(
             .{ .width = groups },
             .{ .width = threads },
         );
     }
 
     /// 2D dispatch - uses 16x16 threadgroups
-    pub fn dispatch2d(self: *ComputeEncoder, width: usize, height: usize) void {
+    pub fn dispatch2d(self: *Self, width: usize, height: usize) *Self {
         const groups_x = (width + 15) / 16;
         const groups_y = (height + 15) / 16;
-        self.dispatch(
+        return self.dispatch(
             .{ .width = groups_x, .height = groups_y },
             .{ .width = 16, .height = 16 },
         );
     }
 
     /// 3D dispatch
-    pub fn dispatch3d(self: *ComputeEncoder, width: usize, height: usize, depth: usize) void {
+    pub fn dispatch3d(self: *Self, width: usize, height: usize, depth: usize) *Self {
         const groups_x = (width + 7) / 8;
         const groups_y = (height + 7) / 8;
         const groups_z = (depth + 7) / 8;
-        self.dispatch(
+        return self.dispatch(
             .{ .width = groups_x, .height = groups_y, .depth = groups_z },
             .{ .width = 8, .height = 8, .depth = 8 },
         );
     }
 
     /// Indirect dispatch - GPU-driven workloads
-    pub fn dispatchIndirect(self: *ComputeEncoder, buf: anytype, offset: usize) void {
+    pub fn dispatchIndirect(self: *Self, buf: anytype, offset: usize) *Self {
         const handle = getHandle(buf);
         const threads = self.current_pipeline.maxThreadsPerThreadgroup();
         mtl.MTLComputeCommandEncoderDispatchThreadgroupsWithIndirectBuffer(
@@ -491,6 +510,7 @@ pub const ComputeEncoder = struct {
             offset,
             mtl.MTLSize{ .width = threads, .height = 1, .depth = 1 },
         );
+        return self;
     }
 
     // -------------------------------------------------------------------------
@@ -498,16 +518,17 @@ pub const ComputeEncoder = struct {
     // -------------------------------------------------------------------------
 
     /// Memory barrier (for concurrent dispatch mode)
-    pub fn barrier(self: *ComputeEncoder, scope: BarrierScope) void {
+    pub fn barrier(self: *Self, scope: BarrierScope) *Self {
         mtl.MTLComputeCommandEncoderMemoryBarrierWithScope(self.handle, @intFromEnum(scope));
+        return self;
     }
 
     // -------------------------------------------------------------------------
     // Lifecycle
     // -------------------------------------------------------------------------
 
-    /// End encoding - usually called via defer
-    pub fn end(self: *ComputeEncoder) void {
+    /// End encoding - call at end of chain or use auto-end on next encoder/submit
+    pub fn end(self: *Self) void {
         if (self.cmd.current_encoder) |enc| {
             if (enc == .compute and enc.compute == self.handle) {
                 mtl.MTLComputeCommandEncoderEndEncoding(self.handle);
@@ -525,23 +546,27 @@ pub const BlitEncoder = struct {
     handle: mtl.MTLBlitCommandEncoderRef,
     cmd: *CommandBuffer,
 
+    const Self = @This();
+
     // -------------------------------------------------------------------------
     // Buffer Copy
     // -------------------------------------------------------------------------
 
     /// Copy entire buffer
-    pub fn copy(self: *BlitEncoder, src: anytype, dst: anytype) void {
+    pub fn copy(self: *Self, src: anytype, dst: anytype) *Self {
         const src_handle = getHandle(src);
         const dst_handle = getHandle(dst);
         const size = getByteSize(src);
         mtl.MTLBlitCommandEncoderCopyFromBuffer(self.handle, src_handle, 0, dst_handle, 0, size);
+        return self;
     }
 
     /// Copy buffer region
-    pub fn copyRegion(self: *BlitEncoder, src: anytype, src_offset: usize, dst: anytype, dst_offset: usize, size: usize) void {
+    pub fn copyRegion(self: *Self, src: anytype, src_offset: usize, dst: anytype, dst_offset: usize, size: usize) *Self {
         const src_handle = getHandle(src);
         const dst_handle = getHandle(dst);
         mtl.MTLBlitCommandEncoderCopyFromBuffer(self.handle, src_handle, src_offset, dst_handle, dst_offset, size);
+        return self;
     }
 
     // -------------------------------------------------------------------------
@@ -549,28 +574,32 @@ pub const BlitEncoder = struct {
     // -------------------------------------------------------------------------
 
     /// Fill entire buffer with value
-    pub fn fill(self: *BlitEncoder, buf: anytype, value: u8) void {
+    pub fn fill(self: *Self, buf: anytype, value: u8) *Self {
         const handle = getHandle(buf);
         const size = getByteSize(buf);
         mtl.MTLBlitCommandEncoderFillBuffer(self.handle, handle, 0, size, value);
+        return self;
     }
 
     /// Fill buffer region
-    pub fn fillRegion(self: *BlitEncoder, buf: anytype, offset: usize, size: usize, value: u8) void {
+    pub fn fillRegion(self: *Self, buf: anytype, offset: usize, size: usize, value: u8) *Self {
         const handle = getHandle(buf);
         mtl.MTLBlitCommandEncoderFillBuffer(self.handle, handle, offset, size, value);
+        return self;
     }
 
     // -------------------------------------------------------------------------
     // Texture Operations
     // -------------------------------------------------------------------------
 
-    pub fn copyTexture(self: *BlitEncoder, src: Texture, dst: Texture) void {
+    pub fn copyTexture(self: *Self, src: Texture, dst: Texture) *Self {
         mtl.MTLBlitCommandEncoderCopyFromTexture(self.handle, src.handle, dst.handle);
+        return self;
     }
 
-    pub fn generateMipmaps(self: *BlitEncoder, tex: Texture) void {
+    pub fn generateMipmaps(self: *Self, tex: Texture) *Self {
         mtl.MTLBlitCommandEncoderGenerateMipmaps(self.handle, tex.handle);
+        return self;
     }
 
     // -------------------------------------------------------------------------
@@ -578,16 +607,17 @@ pub const BlitEncoder = struct {
     // -------------------------------------------------------------------------
 
     /// Synchronize managed buffer (macOS)
-    pub fn synchronize(self: *BlitEncoder, resource: anytype) void {
+    pub fn synchronize(self: *Self, resource: anytype) *Self {
         const handle = getHandle(resource);
         mtl.MTLBlitCommandEncoderSynchronizeResource(self.handle, handle);
+        return self;
     }
 
     // -------------------------------------------------------------------------
     // Lifecycle
     // -------------------------------------------------------------------------
 
-    pub fn end(self: *BlitEncoder) void {
+    pub fn end(self: *Self) void {
         if (self.cmd.current_encoder) |enc| {
             if (enc == .blit and enc.blit == self.handle) {
                 mtl.MTLBlitCommandEncoderEndEncoding(self.handle);
@@ -605,26 +635,28 @@ pub const AccelEncoder = struct {
     handle: mtl.MTLAccelerationStructureCommandEncoderRef,
     cmd: *CommandBuffer,
 
+    const Self = @This();
+
     // -------------------------------------------------------------------------
     // Build
     // -------------------------------------------------------------------------
 
     pub fn build(
-        self: *AccelEncoder,
+        self: *Self,
         accel_struct: AccelerationStructure,
         descriptor: anytype,
         scratch: anytype,
-    ) void {
-        self.buildOffset(accel_struct, descriptor, scratch, 0);
+    ) *Self {
+        return self.buildOffset(accel_struct, descriptor, scratch, 0);
     }
 
     pub fn buildOffset(
-        self: *AccelEncoder,
+        self: *Self,
         accel_struct: AccelerationStructure,
         descriptor: anytype,
         scratch: anytype,
         scratch_offset: usize,
-    ) void {
+    ) *Self {
         const desc_handle = if (@hasField(@TypeOf(descriptor), "handle")) descriptor.handle else descriptor;
         const scratch_handle = getHandle(scratch);
         mtl.MTLAccelerationStructureCommandEncoderBuildAccelerationStructure(
@@ -634,6 +666,7 @@ pub const AccelEncoder = struct {
             scratch_handle,
             scratch_offset,
         );
+        return self;
     }
 
     // -------------------------------------------------------------------------
@@ -641,23 +674,23 @@ pub const AccelEncoder = struct {
     // -------------------------------------------------------------------------
 
     pub fn refit(
-        self: *AccelEncoder,
+        self: *Self,
         src: AccelerationStructure,
         descriptor: anytype,
         dst: AccelerationStructure,
         scratch: anytype,
-    ) void {
-        self.refitOffset(src, descriptor, dst, scratch, 0);
+    ) *Self {
+        return self.refitOffset(src, descriptor, dst, scratch, 0);
     }
 
     pub fn refitOffset(
-        self: *AccelEncoder,
+        self: *Self,
         src: AccelerationStructure,
         descriptor: anytype,
         dst: AccelerationStructure,
         scratch: anytype,
         scratch_offset: usize,
-    ) void {
+    ) *Self {
         const desc_handle = if (@hasField(@TypeOf(descriptor), "handle")) descriptor.handle else descriptor;
         const scratch_handle = getHandle(scratch);
         mtl.MTLAccelerationStructureCommandEncoderRefitAccelerationStructure(
@@ -668,25 +701,28 @@ pub const AccelEncoder = struct {
             scratch_handle,
             scratch_offset,
         );
+        return self;
     }
 
     // -------------------------------------------------------------------------
     // Copy
     // -------------------------------------------------------------------------
 
-    pub fn copy(self: *AccelEncoder, src: AccelerationStructure, dst: AccelerationStructure) void {
+    pub fn copy(self: *Self, src: AccelerationStructure, dst: AccelerationStructure) *Self {
         mtl.MTLAccelerationStructureCommandEncoderCopyAccelerationStructure(self.handle, src.handle, dst.handle);
+        return self;
     }
 
-    pub fn compact(self: *AccelEncoder, src: AccelerationStructure, dst: AccelerationStructure) void {
+    pub fn compact(self: *Self, src: AccelerationStructure, dst: AccelerationStructure) *Self {
         mtl.MTLAccelerationStructureCommandEncoderCopyAndCompactAccelerationStructure(self.handle, src.handle, dst.handle);
+        return self;
     }
 
     // -------------------------------------------------------------------------
     // Queries
     // -------------------------------------------------------------------------
 
-    pub fn writeCompactedSize(self: *AccelEncoder, accel_struct: AccelerationStructure, buf: anytype, offset: usize) void {
+    pub fn writeCompactedSize(self: *Self, accel_struct: AccelerationStructure, buf: anytype, offset: usize) *Self {
         const handle = getHandle(buf);
         mtl.MTLAccelerationStructureCommandEncoderWriteCompactedAccelerationStructureSize(
             self.handle,
@@ -694,26 +730,27 @@ pub const AccelEncoder = struct {
             handle,
             offset,
         );
+        return self;
     }
 
     // -------------------------------------------------------------------------
     // Synchronization
     // -------------------------------------------------------------------------
 
-    pub fn barrier(self: *AccelEncoder) void {
+    pub fn barrier(self: *Self) *Self {
         // Note: Metal uses memoryBarrier for accel encoders
         // This ensures all previous builds complete before subsequent operations
-        _ = self;
         // MTLAccelerationStructureCommandEncoder doesn't have explicit barrier,
         // but operations within it are serialized. Barrier is implicit between
         // accel encoder and next encoder.
+        return self;
     }
 
     // -------------------------------------------------------------------------
     // Lifecycle
     // -------------------------------------------------------------------------
 
-    pub fn end(self: *AccelEncoder) void {
+    pub fn end(self: *Self) void {
         if (self.cmd.current_encoder) |enc| {
             if (enc == .accel and enc.accel == self.handle) {
                 mtl.MTLAccelerationStructureCommandEncoderEndEncoding(self.handle);
