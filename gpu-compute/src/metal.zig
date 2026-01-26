@@ -372,42 +372,6 @@ pub const ComputeEncoderOptions = struct {
 };
 
 // =============================================================================
-// Dispatch Options - Atomic dispatch with explicit bindings
-// =============================================================================
-
-/// Buffer binding with explicit index
-pub const BufferBinding = struct {
-    buf: mtl.MTLBufferRef,
-    index: u32,
-    offset: usize = 0,
-};
-
-/// Bytes binding with explicit index
-pub const BytesBinding = struct {
-    data: *const anyopaque,
-    len: usize,
-    index: u32,
-};
-
-/// Texture binding with explicit index
-pub const TextureBinding = struct {
-    tex: mtl.MTLTextureRef,
-    index: u32,
-};
-
-/// Threadgroup memory binding with explicit index
-pub const ThreadgroupBinding = struct {
-    length: usize,
-    index: u32,
-};
-
-/// Acceleration structure binding with explicit index
-pub const AccelBinding = struct {
-    accel: mtl.MTLAccelerationStructureRef,
-    index: u32,
-};
-
-// =============================================================================
 // ComputeEncoder
 // =============================================================================
 
