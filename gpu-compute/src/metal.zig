@@ -19,15 +19,11 @@ pub const Error = error{
     DeviceNotFound,
     CommandQueueCreationFailed,
     CommandBufferCreationFailed,
-    EncoderCreationFailed,
     LibraryCompilationFailed,
     FunctionNotFound,
     PipelineCreationFailed,
     BufferCreationFailed,
     TextureCreationFailed,
-    AccelerationStructureCreationFailed,
-    SamplerCreationFailed,
-    HeapCreationFailed,
 };
 
 // =============================================================================
@@ -180,26 +176,6 @@ pub const Device = struct {
     /// Convenience: create pipeline from source and function name
     pub fn createPipeline(self: Device, source: [*:0]const u8, function: [*:0]const u8) Error!ComputePipeline {
         return self.createComputePipeline(.{ .source = source, .function = function });
-    }
-
-    // -------------------------------------------------------------------------
-    // Acceleration Structures
-    // -------------------------------------------------------------------------
-
-    pub fn createAccelerationStructure(self: Device, size: u64) Error!AccelerationStructure {
-        const handle = mtl.MTLDeviceNewAccelerationStructureWithSize(self.handle, size) orelse
-            return error.AccelerationStructureCreationFailed;
-        return .{ .handle = handle };
-    }
-
-    pub fn accelSizes(self: Device, descriptor: anytype) AccelSizes {
-        const desc_handle = if (@hasField(@TypeOf(descriptor), "handle")) descriptor.handle else descriptor;
-        const sizes = mtl.MTLDeviceGetAccelerationStructureSizes(self.handle, desc_handle);
-        return .{
-            .acceleration_structure_size = sizes.accelerationStructureSize,
-            .build_scratch_buffer_size = sizes.buildScratchBufferSize,
-            .refit_scratch_buffer_size = sizes.refitScratchBufferSize,
-        };
     }
 
     // -------------------------------------------------------------------------
@@ -986,148 +962,6 @@ pub const ComputePipelineDescriptor = struct {
     function: [*:0]const u8,
 };
 
-pub const AccelSizes = struct {
-    acceleration_structure_size: u64,
-    build_scratch_buffer_size: u64,
-    refit_scratch_buffer_size: u64,
-};
-
-// =============================================================================
-// Acceleration Structure Descriptors
-// =============================================================================
-
-pub const TriangleGeometryDescriptor = struct {
-    handle: mtl.MTLAccelerationStructureTriangleGeometryDescriptorRef,
-
-    pub fn init() TriangleGeometryDescriptor {
-        return .{ .handle = mtl.MTLAccelerationStructureTriangleGeometryDescriptorCreate() };
-    }
-
-    pub fn vertexBuffer(self: TriangleGeometryDescriptor, buf: anytype, stride: u64) TriangleGeometryDescriptor {
-        return self.vertexBufferOffset(buf, 0, stride);
-    }
-
-    pub fn vertexBufferOffset(self: TriangleGeometryDescriptor, buf: anytype, offset: u64, stride: u64) TriangleGeometryDescriptor {
-        const handle = getHandle(buf);
-        mtl.MTLAccelerationStructureTriangleGeometryDescriptorSetVertexBuffer(self.handle, handle);
-        mtl.MTLAccelerationStructureTriangleGeometryDescriptorSetVertexBufferOffset(self.handle, offset);
-        mtl.MTLAccelerationStructureTriangleGeometryDescriptorSetVertexStride(self.handle, stride);
-        return self;
-    }
-
-    pub fn indexBuffer(self: TriangleGeometryDescriptor, buf: anytype, index_type: IndexType) TriangleGeometryDescriptor {
-        return self.indexBufferOffset(buf, index_type, 0);
-    }
-
-    pub fn indexBufferOffset(self: TriangleGeometryDescriptor, buf: anytype, index_type: IndexType, offset: u64) TriangleGeometryDescriptor {
-        const handle = getHandle(buf);
-        mtl.MTLAccelerationStructureTriangleGeometryDescriptorSetIndexBuffer(self.handle, handle);
-        mtl.MTLAccelerationStructureTriangleGeometryDescriptorSetIndexBufferOffset(self.handle, offset);
-        mtl.MTLAccelerationStructureTriangleGeometryDescriptorSetIndexType(self.handle, @intFromEnum(index_type));
-        return self;
-    }
-
-    pub fn triangleCount(self: TriangleGeometryDescriptor, count: u64) TriangleGeometryDescriptor {
-        mtl.MTLAccelerationStructureTriangleGeometryDescriptorSetTriangleCount(self.handle, count);
-        return self;
-    }
-};
-
-pub const BoundingBoxGeometryDescriptor = struct {
-    handle: mtl.MTLAccelerationStructureBoundingBoxGeometryDescriptorRef,
-
-    pub fn init() BoundingBoxGeometryDescriptor {
-        return .{ .handle = mtl.MTLAccelerationStructureBoundingBoxGeometryDescriptorCreate() };
-    }
-
-    pub fn boundingBoxBuffer(self: BoundingBoxGeometryDescriptor, buf: anytype, stride: u64) BoundingBoxGeometryDescriptor {
-        return self.boundingBoxBufferOffset(buf, 0, stride);
-    }
-
-    pub fn boundingBoxBufferOffset(self: BoundingBoxGeometryDescriptor, buf: anytype, offset: u64, stride: u64) BoundingBoxGeometryDescriptor {
-        const handle = getHandle(buf);
-        mtl.MTLAccelerationStructureBoundingBoxGeometryDescriptorSetBoundingBoxBuffer(self.handle, handle);
-        mtl.MTLAccelerationStructureBoundingBoxGeometryDescriptorSetBoundingBoxBufferOffset(self.handle, offset);
-        mtl.MTLAccelerationStructureBoundingBoxGeometryDescriptorSetBoundingBoxStride(self.handle, stride);
-        return self;
-    }
-
-    pub fn boundingBoxCount(self: BoundingBoxGeometryDescriptor, count: u64) BoundingBoxGeometryDescriptor {
-        mtl.MTLAccelerationStructureBoundingBoxGeometryDescriptorSetBoundingBoxCount(self.handle, count);
-        return self;
-    }
-};
-
-pub const PrimitiveAccelerationStructureDescriptor = struct {
-    handle: mtl.MTLPrimitiveAccelerationStructureDescriptorRef,
-    geometry_handles: [64]*anyopaque = undefined,
-    geometry_count: usize = 0,
-
-    pub fn init() PrimitiveAccelerationStructureDescriptor {
-        return .{ .handle = mtl.MTLPrimitiveAccelerationStructureDescriptorCreate() };
-    }
-
-    pub fn addGeometry(self: *PrimitiveAccelerationStructureDescriptor, geometry: anytype) void {
-        if (self.geometry_count >= 64) return;
-        const geo_handle = if (@hasField(@TypeOf(geometry), "handle")) geometry.handle else geometry;
-        self.geometry_handles[self.geometry_count] = geo_handle.?;
-        self.geometry_count += 1;
-    }
-
-    pub fn build(self: *PrimitiveAccelerationStructureDescriptor) void {
-        if (self.geometry_count > 0) {
-            mtl.MTLPrimitiveAccelerationStructureDescriptorSetGeometryDescriptors(
-                self.handle,
-                @ptrCast(&self.geometry_handles),
-                self.geometry_count,
-            );
-        }
-    }
-};
-
-pub const InstanceAccelerationStructureDescriptor = struct {
-    handle: mtl.MTLInstanceAccelerationStructureDescriptorRef,
-    blas_handles: [256]mtl.MTLAccelerationStructureRef = undefined,
-    blas_count: usize = 0,
-
-    pub fn init() InstanceAccelerationStructureDescriptor {
-        return .{ .handle = mtl.MTLInstanceAccelerationStructureDescriptorCreate() };
-    }
-
-    pub fn instanceDescriptorBuffer(self: InstanceAccelerationStructureDescriptor, buf: anytype, stride: u64) InstanceAccelerationStructureDescriptor {
-        return self.instanceDescriptorBufferOffset(buf, 0, stride);
-    }
-
-    pub fn instanceDescriptorBufferOffset(self: InstanceAccelerationStructureDescriptor, buf: anytype, offset: u64, stride: u64) InstanceAccelerationStructureDescriptor {
-        const handle = getHandle(buf);
-        mtl.MTLInstanceAccelerationStructureDescriptorSetInstanceDescriptorBuffer(self.handle, handle);
-        mtl.MTLInstanceAccelerationStructureDescriptorSetInstanceDescriptorBufferOffset(self.handle, offset);
-        mtl.MTLInstanceAccelerationStructureDescriptorSetInstanceDescriptorStride(self.handle, stride);
-        return self;
-    }
-
-    pub fn instanceCount(self: InstanceAccelerationStructureDescriptor, count: u64) InstanceAccelerationStructureDescriptor {
-        mtl.MTLInstanceAccelerationStructureDescriptorSetInstanceCount(self.handle, count);
-        return self;
-    }
-
-    pub fn addInstancedAccelerationStructure(self: *InstanceAccelerationStructureDescriptor, accel_struct: AccelerationStructure) void {
-        if (self.blas_count >= 256) return;
-        self.blas_handles[self.blas_count] = accel_struct.handle;
-        self.blas_count += 1;
-    }
-
-    pub fn build(self: *InstanceAccelerationStructureDescriptor) void {
-        if (self.blas_count > 0) {
-            mtl.MTLInstanceAccelerationStructureDescriptorSetInstancedAccelerationStructures(
-                self.handle,
-                @ptrCast(&self.blas_handles),
-                self.blas_count,
-            );
-        }
-    }
-};
-
 // =============================================================================
 // Enums
 // =============================================================================
@@ -1270,7 +1104,7 @@ fn buildBLASInternal(device: mtl.MTLDeviceRef, enc: mtl.MTLAccelerationStructure
 
         // Determine index type from buffer element type
         const IndexElem = if (@hasField(@TypeOf(index_buf), "ElementType")) index_buf.ElementType else u32;
-        const index_type: u32 = if (IndexElem == u16) @intFromEnum(IndexType.u16) else @intFromEnum(IndexType.u32);
+        const index_type: u32 = if (IndexElem == u16) @intFromEnum(IndexType.uint16) else @intFromEnum(IndexType.uint32);
         mtl.MTLAccelerationStructureTriangleGeometryDescriptorSetIndexType(geo_desc, index_type);
 
         // Triangle count from indices
