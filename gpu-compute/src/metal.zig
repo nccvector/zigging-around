@@ -495,7 +495,11 @@ pub const ComputeEncoder = struct {
             const accel_info = @typeInfo(@TypeOf(accels));
             if (accel_info == .@"struct" and accel_info.@"struct".is_tuple) {
                 inline for (accels) |binding| {
-                    const accel_handle = if (@hasField(@TypeOf(binding.accel), "handle")) binding.accel.handle else binding.accel;
+                    const AccelType = @TypeOf(binding.accel);
+                    const accel_handle = if (@typeInfo(AccelType) == .@"struct" and @hasField(AccelType, "handle"))
+                        binding.accel.handle
+                    else
+                        binding.accel;
                     mtl.MTLComputeCommandEncoderSetAccelerationStructure(self.handle, accel_handle, binding.index);
                 }
             }
