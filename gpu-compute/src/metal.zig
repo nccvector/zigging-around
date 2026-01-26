@@ -223,7 +223,7 @@ pub const Device = struct {
             return error.CommandBufferCreationFailed;
         return .{
             .handle = handle,
-            .current_encoder = null,
+            .device = self.handle,
         };
     }
 
@@ -239,7 +239,6 @@ pub const Device = struct {
     /// Submit and wait for completion
     pub fn submit(self: Device, cmd: *CommandBuffer) void {
         _ = self;
-        cmd.endCurrentEncoder();
         mtl.MTLCommandBufferCommit(cmd.handle);
         mtl.MTLCommandBufferWaitUntilCompleted(cmd.handle);
     }
@@ -247,7 +246,6 @@ pub const Device = struct {
     /// Submit and return fence for async waiting
     pub fn submitAsync(self: Device, cmd: *CommandBuffer) Fence {
         _ = self;
-        cmd.endCurrentEncoder();
         mtl.MTLCommandBufferCommit(cmd.handle);
         return .{ .command_buffer = cmd.handle };
     }
@@ -259,78 +257,35 @@ pub const Device = struct {
 
 pub const CommandBuffer = struct {
     handle: mtl.MTLCommandBufferRef,
-    current_encoder: ?EncoderHandle,
-
-    // Storage for encoders so we can return pointers for chaining
-    compute_encoder: ComputeEncoder = undefined,
-    blit_encoder: BlitEncoder = undefined,
-    accel_encoder: AccelEncoder = undefined,
-
-    const EncoderHandle = union(enum) {
-        compute: mtl.MTLComputeCommandEncoderRef,
-        blit: mtl.MTLBlitCommandEncoderRef,
-        accel: mtl.MTLAccelerationStructureCommandEncoderRef,
-        // render: mtl.MTLRenderCommandEncoderRef, // TODO
-    };
-
-    /// End any active encoder
-    fn endCurrentEncoder(self: *CommandBuffer) void {
-        if (self.current_encoder) |enc| {
-            switch (enc) {
-                .compute => |e| mtl.MTLComputeCommandEncoderEndEncoding(e),
-                .blit => |e| mtl.MTLBlitCommandEncoderEndEncoding(e),
-                .accel => |e| mtl.MTLAccelerationStructureCommandEncoderEndEncoding(e),
-            }
-            self.current_encoder = null;
-        }
-    }
+    device: mtl.MTLDeviceRef,
 
     // -------------------------------------------------------------------------
     // Encoder Creation
     // -------------------------------------------------------------------------
 
-    pub fn createComputeEncoder(self: *CommandBuffer, opts: ComputeEncoderOptions) *ComputeEncoder {
-        self.endCurrentEncoder();
-
+    pub fn createComputeEncoder(self: CommandBuffer, opts: ComputeEncoderOptions) ComputeEncoder {
         const enc = if (opts.concurrent)
             mtl.MTLCommandBufferComputeCommandEncoderWithDispatchType(self.handle, mtl.MTLDispatchTypeConcurrent)
         else
             mtl.MTLCommandBufferComputeCommandEncoder(self.handle);
 
-        self.current_encoder = .{ .compute = enc };
-
-        self.compute_encoder = .{
+        return .{
             .handle = enc,
-            .cmd = self,
             .current_pipeline = null,
         };
-        return &self.compute_encoder;
     }
 
-    pub fn createBlitEncoder(self: *CommandBuffer) *BlitEncoder {
-        self.endCurrentEncoder();
-
-        const enc = mtl.MTLCommandBufferBlitCommandEncoder(self.handle);
-        self.current_encoder = .{ .blit = enc };
-
-        self.blit_encoder = .{
-            .handle = enc,
-            .cmd = self,
+    pub fn createBlitEncoder(self: CommandBuffer) BlitEncoder {
+        return .{
+            .handle = mtl.MTLCommandBufferBlitCommandEncoder(self.handle),
         };
-        return &self.blit_encoder;
     }
 
-    pub fn createAccelEncoder(self: *CommandBuffer) *AccelEncoder {
-        self.endCurrentEncoder();
-
-        const enc = mtl.MTLCommandBufferAccelerationStructureCommandEncoder(self.handle);
-        self.current_encoder = .{ .accel = enc };
-
-        self.accel_encoder = .{
-            .handle = enc,
-            .cmd = self,
+    pub fn createAccelEncoder(self: CommandBuffer) AccelEncoder {
+        return .{
+            .handle = mtl.MTLCommandBufferAccelerationStructureCommandEncoder(self.handle),
+            .device = self.device,
         };
-        return &self.accel_encoder;
     }
 
     // -------------------------------------------------------------------------
@@ -343,6 +298,72 @@ pub const CommandBuffer = struct {
 
     pub fn wait(self: *CommandBuffer, evt: Event, value: u64) void {
         mtl.MTLCommandBufferEncodeWaitForEvent(self.handle, evt.handle, value);
+    }
+
+    // -------------------------------------------------------------------------
+    // Acceleration Structure Building (simplified API)
+    // -------------------------------------------------------------------------
+
+    /// Build a single BLAS from triangle geometry
+    ///
+    /// Example:
+    ///   const blas = cmd.buildBLAS(.{ .vertices = vertex_buf });
+    pub fn buildBLAS(self: CommandBuffer, opts: anytype) BLAS {
+        const enc_handle = mtl.MTLCommandBufferAccelerationStructureCommandEncoder(self.handle);
+        const blas = buildBLASInternal(self.device, enc_handle, opts);
+        mtl.MTLAccelerationStructureCommandEncoderEndEncoding(enc_handle);
+        return blas;
+    }
+
+    /// Build multiple BLASes in a single encoder (more efficient for batches)
+    ///
+    /// Example:
+    ///   const blases = cmd.buildBLASes(.{
+    ///       .{ .vertices = mesh1_verts },
+    ///       .{ .vertices = mesh2_verts },
+    ///       .{ .vertices = mesh3_verts },
+    ///   });
+    pub fn buildBLASes(self: CommandBuffer, opts_tuple: anytype) BuildBLASesResult(@TypeOf(opts_tuple)) {
+        const T = @TypeOf(opts_tuple);
+        const info = @typeInfo(T);
+        if (info != .@"struct" or !info.@"struct".is_tuple) {
+            @compileError("buildBLASes expects a tuple of BLAS options");
+        }
+        const N = info.@"struct".fields.len;
+
+        const enc_handle = mtl.MTLCommandBufferAccelerationStructureCommandEncoder(self.handle);
+
+        var results: [N]BLAS = undefined;
+
+        inline for (0..N) |i| {
+            results[i] = buildBLASInternal(self.device, enc_handle, opts_tuple[i]);
+        }
+
+        mtl.MTLAccelerationStructureCommandEncoderEndEncoding(enc_handle);
+
+        return results;
+    }
+
+    fn BuildBLASesResult(comptime T: type) type {
+        const info = @typeInfo(T);
+        if (info != .@"struct" or !info.@"struct".is_tuple) {
+            return void;
+        }
+        return [info.@"struct".fields.len]BLAS;
+    }
+
+    /// Build a TLAS from BLAS instances
+    ///
+    /// Example:
+    ///   const tlas = cmd.buildTLAS(.{
+    ///       .instances = instance_buf,
+    ///       .blas = &.{ blas1, blas2 },
+    ///   });
+    pub fn buildTLAS(self: CommandBuffer, opts: anytype) TLAS {
+        const enc_handle = mtl.MTLCommandBufferAccelerationStructureCommandEncoder(self.handle);
+        const tlas = buildTLASInternal(self.device, enc_handle, opts);
+        mtl.MTLAccelerationStructureCommandEncoderEndEncoding(enc_handle);
+        return tlas;
     }
 };
 
@@ -392,7 +413,6 @@ pub const AccelBinding = struct {
 
 pub const ComputeEncoder = struct {
     handle: mtl.MTLComputeCommandEncoderRef,
-    cmd: *CommandBuffer,
     current_pipeline: ?ComputePipeline,
 
     const Self = @This();
@@ -556,14 +576,9 @@ pub const ComputeEncoder = struct {
     // Lifecycle
     // -------------------------------------------------------------------------
 
-    /// End encoding - call at end of chain or use auto-end on next encoder/submit
+    /// End encoding
     pub fn end(self: *Self) void {
-        if (self.cmd.current_encoder) |enc| {
-            if (enc == .compute and enc.compute == self.handle) {
-                mtl.MTLComputeCommandEncoderEndEncoding(self.handle);
-                self.cmd.current_encoder = null;
-            }
-        }
+        mtl.MTLComputeCommandEncoderEndEncoding(self.handle);
     }
 };
 
@@ -573,7 +588,6 @@ pub const ComputeEncoder = struct {
 
 pub const BlitEncoder = struct {
     handle: mtl.MTLBlitCommandEncoderRef,
-    cmd: *CommandBuffer,
 
     const Self = @This();
 
@@ -647,27 +661,29 @@ pub const BlitEncoder = struct {
     // -------------------------------------------------------------------------
 
     pub fn end(self: *Self) void {
-        if (self.cmd.current_encoder) |enc| {
-            if (enc == .blit and enc.blit == self.handle) {
-                mtl.MTLBlitCommandEncoderEndEncoding(self.handle);
-                self.cmd.current_encoder = null;
-            }
-        }
+        mtl.MTLBlitCommandEncoderEndEncoding(self.handle);
     }
 };
 
 // =============================================================================
-// AccelEncoder
+// AccelEncoder (for advanced use cases: refit, compact, copy)
 // =============================================================================
+//
+// For simple BLAS/TLAS creation, use:
+//   cmd.buildBLAS(.{ .vertices = vertex_buf })
+//   cmd.buildBLASes(.{ ... })
+//   cmd.buildTLAS(.{ .instances = inst_buf, .blas = &.{...} })
+//
+// AccelEncoder is exposed for advanced operations like refit and compaction.
 
 pub const AccelEncoder = struct {
     handle: mtl.MTLAccelerationStructureCommandEncoderRef,
-    cmd: *CommandBuffer,
+    device: mtl.MTLDeviceRef,
 
     const Self = @This();
 
     // -------------------------------------------------------------------------
-    // Build
+    // Low-level Build (for advanced use cases like refit)
     // -------------------------------------------------------------------------
 
     pub fn build(
@@ -779,13 +795,9 @@ pub const AccelEncoder = struct {
     // Lifecycle
     // -------------------------------------------------------------------------
 
+    /// End encoding
     pub fn end(self: *Self) void {
-        if (self.cmd.current_encoder) |enc| {
-            if (enc == .accel and enc.accel == self.handle) {
-                mtl.MTLAccelerationStructureCommandEncoderEndEncoding(self.handle);
-                self.cmd.current_encoder = null;
-            }
-        }
+        mtl.MTLAccelerationStructureCommandEncoderEndEncoding(self.handle);
     }
 };
 
@@ -911,6 +923,50 @@ pub const AccelerationStructure = struct {
     pub fn size(self: AccelerationStructure) u64 {
         return mtl.MTLAccelerationStructureSize(self.handle);
     }
+};
+
+/// Bottom-Level Acceleration Structure (BLAS) - contains triangle/bounding box geometry
+/// Created via device.createBLAS()
+pub const BLAS = struct {
+    handle: mtl.MTLAccelerationStructureRef,
+    descriptor: mtl.MTLPrimitiveAccelerationStructureDescriptorRef,
+    scratch: mtl.MTLBufferRef, // Kept for potential refit operations
+
+    pub fn size(self: BLAS) u64 {
+        return mtl.MTLAccelerationStructureSize(self.handle);
+    }
+};
+
+/// Top-Level Acceleration Structure (TLAS) - contains instances of BLAS with transforms
+/// Created via device.createTLAS()
+pub const TLAS = struct {
+    handle: mtl.MTLAccelerationStructureRef,
+    descriptor: mtl.MTLInstanceAccelerationStructureDescriptorRef,
+    scratch: mtl.MTLBufferRef,
+
+    pub fn size(self: TLAS) u64 {
+        return mtl.MTLAccelerationStructureSize(self.handle);
+    }
+};
+
+/// Instance descriptor for TLAS - matches Metal's MTLAccelerationStructureInstanceDescriptor
+/// Pack this into a buffer and pass to device.createTLAS()
+pub const MTLAccelerationStructureInstanceDescriptor = extern struct {
+    /// 4x3 transformation matrix (column-major, last row implicitly [0,0,0,1])
+    transform: [4][3]f32 = .{
+        .{ 1, 0, 0 }, // column 0
+        .{ 0, 1, 0 }, // column 1
+        .{ 0, 0, 1 }, // column 2
+        .{ 0, 0, 0 }, // column 3 (translation)
+    },
+    /// Options (MTLAccelerationStructureInstanceOptions)
+    options: u32 = 0,
+    /// Visibility mask for ray intersection
+    mask: u32 = 0xFF,
+    /// Offset into intersection function table
+    intersection_function_table_offset: u32 = 0,
+    /// Index into the BLAS array passed to createTLAS
+    acceleration_structure_index: u32 = 0,
 };
 
 // =============================================================================
@@ -1216,4 +1272,127 @@ fn getByteSize(resource: anytype) usize {
     } else {
         return 0;
     }
+}
+
+/// Internal helper for building a BLAS - used by both single and batch APIs
+fn buildBLASInternal(device: mtl.MTLDeviceRef, enc: mtl.MTLAccelerationStructureCommandEncoderRef, opts: anytype) BLAS {
+    const T = @TypeOf(opts);
+
+    // Get vertex buffer
+    const vertex_buf = opts.vertices;
+    const vertex_handle = getHandle(vertex_buf);
+
+    // Infer vertex stride from buffer's element type, or use override
+    const vertex_stride: u64 = if (@hasField(T, "vertex_stride"))
+        opts.vertex_stride
+    else if (@hasField(@TypeOf(vertex_buf), "ElementType"))
+        @sizeOf(vertex_buf.ElementType)
+    else
+        @sizeOf(f32) * 3; // Default: packed float3
+
+    // Create geometry descriptor
+    const geo_desc = mtl.MTLAccelerationStructureTriangleGeometryDescriptorCreate();
+    mtl.MTLAccelerationStructureTriangleGeometryDescriptorSetVertexBuffer(geo_desc, vertex_handle);
+    mtl.MTLAccelerationStructureTriangleGeometryDescriptorSetVertexBufferOffset(geo_desc, 0);
+    mtl.MTLAccelerationStructureTriangleGeometryDescriptorSetVertexStride(geo_desc, vertex_stride);
+
+    // Handle optional index buffer
+    var triangle_count: u64 = undefined;
+    if (@hasField(T, "indices")) {
+        const index_buf = opts.indices;
+        const index_handle = getHandle(index_buf);
+        mtl.MTLAccelerationStructureTriangleGeometryDescriptorSetIndexBuffer(geo_desc, index_handle);
+        mtl.MTLAccelerationStructureTriangleGeometryDescriptorSetIndexBufferOffset(geo_desc, 0);
+
+        // Determine index type from buffer element type
+        const IndexElem = if (@hasField(@TypeOf(index_buf), "ElementType")) index_buf.ElementType else u32;
+        const index_type: u32 = if (IndexElem == u16) @intFromEnum(IndexType.u16) else @intFromEnum(IndexType.u32);
+        mtl.MTLAccelerationStructureTriangleGeometryDescriptorSetIndexType(geo_desc, index_type);
+
+        // Triangle count from indices
+        triangle_count = if (@hasField(T, "triangle_count"))
+            opts.triangle_count
+        else if (@hasField(@TypeOf(index_buf), "len"))
+            index_buf.len / 3
+        else
+            1;
+    } else {
+        // Triangle count from vertices (non-indexed)
+        triangle_count = if (@hasField(T, "triangle_count"))
+            opts.triangle_count
+        else if (@hasField(@TypeOf(vertex_buf), "len"))
+            vertex_buf.len / 3
+        else
+            1;
+    }
+    mtl.MTLAccelerationStructureTriangleGeometryDescriptorSetTriangleCount(geo_desc, triangle_count);
+
+    // Create primitive acceleration structure descriptor
+    const prim_desc = mtl.MTLPrimitiveAccelerationStructureDescriptorCreate();
+    var geo_handles = [_]*anyopaque{geo_desc.?};
+    mtl.MTLPrimitiveAccelerationStructureDescriptorSetGeometryDescriptors(prim_desc, @ptrCast(&geo_handles), 1);
+
+    // Query sizes
+    const sizes = mtl.MTLDeviceGetAccelerationStructureSizes(device, prim_desc);
+
+    // Allocate acceleration structure
+    const accel_handle = mtl.MTLDeviceNewAccelerationStructureWithSize(device, sizes.accelerationStructureSize);
+
+    // Allocate scratch buffer (temporary, private storage)
+    const scratch_handle = mtl.MTLDeviceNewBufferWithLength(device, sizes.buildScratchBufferSize, StorageMode.private.toResourceOptions());
+
+    // Build
+    mtl.MTLAccelerationStructureCommandEncoderBuildAccelerationStructure(enc, accel_handle, prim_desc, scratch_handle, 0);
+
+    return .{
+        .handle = accel_handle,
+        .descriptor = prim_desc,
+        .scratch = scratch_handle,
+    };
+}
+
+/// Internal helper for building a TLAS
+fn buildTLASInternal(device: mtl.MTLDeviceRef, enc: mtl.MTLAccelerationStructureCommandEncoderRef, opts: anytype) TLAS {
+    const instance_buf = opts.instances;
+    const instance_handle = getHandle(instance_buf);
+    const blas_list = opts.blas;
+
+    // Get instance count
+    const instance_count: u64 = if (@hasField(@TypeOf(instance_buf), "len"))
+        instance_buf.len
+    else
+        1;
+
+    // Create instance acceleration structure descriptor
+    const inst_desc = mtl.MTLInstanceAccelerationStructureDescriptorCreate();
+    mtl.MTLInstanceAccelerationStructureDescriptorSetInstanceDescriptorBuffer(inst_desc, instance_handle);
+    mtl.MTLInstanceAccelerationStructureDescriptorSetInstanceDescriptorBufferOffset(inst_desc, 0);
+    mtl.MTLInstanceAccelerationStructureDescriptorSetInstanceDescriptorStride(inst_desc, @sizeOf(MTLAccelerationStructureInstanceDescriptor));
+    mtl.MTLInstanceAccelerationStructureDescriptorSetInstanceCount(inst_desc, instance_count);
+
+    // Collect BLAS handles
+    var blas_handles: [256]mtl.MTLAccelerationStructureRef = undefined;
+    const blas_count = @min(blas_list.len, 256);
+    for (0..blas_count) |i| {
+        blas_handles[i] = blas_list[i].handle;
+    }
+    mtl.MTLInstanceAccelerationStructureDescriptorSetInstancedAccelerationStructures(inst_desc, @ptrCast(&blas_handles), blas_count);
+
+    // Query sizes
+    const sizes = mtl.MTLDeviceGetAccelerationStructureSizes(device, inst_desc);
+
+    // Allocate acceleration structure
+    const accel_handle = mtl.MTLDeviceNewAccelerationStructureWithSize(device, sizes.accelerationStructureSize);
+
+    // Allocate scratch buffer
+    const scratch_handle = mtl.MTLDeviceNewBufferWithLength(device, sizes.buildScratchBufferSize, StorageMode.private.toResourceOptions());
+
+    // Build
+    mtl.MTLAccelerationStructureCommandEncoderBuildAccelerationStructure(enc, accel_handle, inst_desc, scratch_handle, 0);
+
+    return .{
+        .handle = accel_handle,
+        .descriptor = inst_desc,
+        .scratch = scratch_handle,
+    };
 }

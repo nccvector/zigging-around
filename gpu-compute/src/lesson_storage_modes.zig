@@ -33,20 +33,17 @@ pub fn main() !void {
     var cmd = try device.createCommand();
     {
         // Copy data host -> device
-        cmd.createBlitEncoder()
-            .copy(shared, private)
-            .end();
+        var blit1 = cmd.createBlitEncoder();
+        blit1.copy(shared, private).end();
 
-        cmd.createComputeEncoder(.{})
-            .dispatch1d(pipeline, COUNT, .{
-                .buffers = .{.{ .buf = private, .index = 0 }},
-            })
-            .end();
+        var comp = cmd.createComputeEncoder(.{});
+        comp.dispatch1d(pipeline, COUNT, .{
+            .buffers = .{.{ .buf = private, .index = 0 }},
+        }).end();
 
         // Copy data device -> host
-        cmd.createBlitEncoder()
-            .copy(private, shared)
-            .end();
+        var blit2 = cmd.createBlitEncoder();
+        blit2.copy(private, shared).end();
     }
 
     device.submit(&cmd);

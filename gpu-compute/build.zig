@@ -77,6 +77,16 @@ pub fn build(b: *std.Build) void {
     });
     setup_metal_target(b, metal_cpp_dep, lesson_double_buffering);
 
+    const lesson_acceleration_structures = b.addExecutable(.{
+        .name = "lesson-acceleration-structures",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/lesson_acceleration_structures.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    setup_metal_target(b, metal_cpp_dep, lesson_acceleration_structures);
+
     // Tests
     const unit_tests = b.addTest(.{
         .root_module = b.createModule(.{

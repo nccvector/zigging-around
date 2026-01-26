@@ -45,15 +45,14 @@ pub fn main() !void {
 
     // Execute using new atomic dispatch API
     var cmd = try device.createCommand();
-    cmd.createComputeEncoder(.{})
-        .dispatch1d(pipeline, count, .{
-            .buffers = .{
-                .{ .buf = buf_a, .index = 0 },
-                .{ .buf = buf_b, .index = 1 },
-                .{ .buf = buf_c, .index = 2 },
-            },
-        })
-        .end();
+    var enc = cmd.createComputeEncoder(.{});
+    enc.dispatch1d(pipeline, count, .{
+        .buffers = .{
+            .{ .buf = buf_a, .index = 0 },
+            .{ .buf = buf_b, .index = 1 },
+            .{ .buf = buf_c, .index = 2 },
+        },
+    }).end();
     device.submit(&cmd);
 
     // Verify
@@ -90,13 +89,12 @@ test "basic_compute" {
     const buf = try device.createBuffer(f32, count, .{});
 
     var cmd = try device.createCommand();
-    cmd.createComputeEncoder(.{})
-        .dispatch1d(pipeline, count, .{
-            .buffers = .{
-                .{ .buf = buf, .index = 0 },
-            },
-        })
-        .end();
+    var enc = cmd.createComputeEncoder(.{});
+    enc.dispatch1d(pipeline, count, .{
+        .buffers = .{
+            .{ .buf = buf, .index = 0 },
+        },
+    }).end();
     device.submit(&cmd);
 
     // Verify
@@ -126,13 +124,12 @@ test "async_submission" {
     const buf = try device.createBuffer(f32, count, .{});
 
     var cmd = try device.createCommand();
-    cmd.createComputeEncoder(.{})
-        .dispatch1d(pipeline, count, .{
-            .buffers = .{
-                .{ .buf = buf, .index = 0 },
-            },
-        })
-        .end();
+    var enc = cmd.createComputeEncoder(.{});
+    enc.dispatch1d(pipeline, count, .{
+        .buffers = .{
+            .{ .buf = buf, .index = 0 },
+        },
+    }).end();
 
     // Async submission
     const fence = device.submitAsync(&cmd);
@@ -181,18 +178,16 @@ test "pipeline_switching" {
 
     // Two dispatches: 1.0 -> double -> 2.0 -> add_ten -> 12.0
     var cmd = try device.createCommand();
-    cmd.createComputeEncoder(.{})
-        .dispatch1d(double_pipeline, count, .{
-            .buffers = .{
-                .{ .buf = buf, .index = 0 },
-            },
-        })
-        .dispatch1d(add_pipeline, count, .{
-            .buffers = .{
-                .{ .buf = buf, .index = 0 },
-            },
-        })
-        .end();
+    var enc = cmd.createComputeEncoder(.{});
+    enc.dispatch1d(double_pipeline, count, .{
+        .buffers = .{
+            .{ .buf = buf, .index = 0 },
+        },
+    }).dispatch1d(add_pipeline, count, .{
+        .buffers = .{
+            .{ .buf = buf, .index = 0 },
+        },
+    }).end();
     device.submit(&cmd);
 
     // Verify
@@ -224,18 +219,16 @@ test "multi_encoder_command_buffer" {
     var cmd = try device.createCommand();
 
     // Compute pass: fill src with 42
-    cmd.createComputeEncoder(.{})
-        .dispatch1d(pipeline, count, .{
-            .buffers = .{
-                .{ .buf = src_buf, .index = 0 },
-            },
-        })
-        .end();
+    var comp_enc = cmd.createComputeEncoder(.{});
+    comp_enc.dispatch1d(pipeline, count, .{
+        .buffers = .{
+            .{ .buf = src_buf, .index = 0 },
+        },
+    }).end();
 
     // Blit pass: copy src to dst
-    cmd.createBlitEncoder()
-        .copy(src_buf, dst_buf)
-        .end();
+    var blit_enc = cmd.createBlitEncoder();
+    blit_enc.copy(src_buf, dst_buf).end();
 
     device.submit(&cmd);
 
@@ -281,16 +274,15 @@ test "bytes_uniform_data" {
     const params = Params{ .scale = 2.0, .offset = 0 };
 
     var cmd = try device.createCommand();
-    cmd.createComputeEncoder(.{})
-        .dispatch1d(pipeline, 8, .{
-            .buffers = .{
-                .{ .buf = buf, .index = 0 },
-            },
-            .bytes = .{
-                .{ .data = &params, .index = 1 },
-            },
-        })
-        .end();
+    var enc = cmd.createComputeEncoder(.{});
+    enc.dispatch1d(pipeline, 8, .{
+        .buffers = .{
+            .{ .buf = buf, .index = 0 },
+        },
+        .bytes = .{
+            .{ .data = &params, .index = 1 },
+        },
+    }).end();
     device.submit(&cmd);
 
     // Verify: [2, 4, 6, 8, 10, 12, 14, 16]
@@ -353,28 +345,27 @@ test "concurrent_dispatch_with_barrier" {
     const params2 = Params{ .scale = 3.0, .offset = 0 };
 
     var cmd = try device.createCommand();
-    cmd.createComputeEncoder(.{ .concurrent = true })
-        // x2
-        .dispatch1d(pipeline, 8, .{
-            .buffers = .{
-                .{ .buf = buf, .index = 0 },
-            },
-            .bytes = .{
-                .{ .data = &params1, .index = 1 },
-            },
-        })
-        // Barrier required for concurrent when same buffer
-        .barrier(.buffers)
-        // x3
-        .dispatch1d(pipeline, 8, .{
-            .buffers = .{
-                .{ .buf = buf, .index = 0 },
-            },
-            .bytes = .{
-                .{ .data = &params2, .index = 1 },
-            },
-        })
-        .end();
+    var enc = cmd.createComputeEncoder(.{ .concurrent = true });
+    // x2
+    enc.dispatch1d(pipeline, 8, .{
+        .buffers = .{
+            .{ .buf = buf, .index = 0 },
+        },
+        .bytes = .{
+            .{ .data = &params1, .index = 1 },
+        },
+    })
+    // Barrier required for concurrent when same buffer
+    .barrier(.buffers)
+    // x3
+    .dispatch1d(pipeline, 8, .{
+        .buffers = .{
+            .{ .buf = buf, .index = 0 },
+        },
+        .bytes = .{
+            .{ .data = &params2, .index = 1 },
+        },
+    }).end();
     device.submit(&cmd);
 
     // Verify: [6, 12, 18, 24, 30, 36, 42, 48]
@@ -390,44 +381,21 @@ test "acceleration_structure" {
         return; // Skip on devices without ray tracing
     }
 
+    const Vec3 = packed struct { x: f32, y: f32, z: f32 };
+
     // Create vertex buffer for a triangle
-    const vertices = [_]f32{
-        0.0, 0.0, 0.0, // v0
-        1.0, 0.0, 0.0, // v1
-        0.5, 1.0, 0.0, // v2
+    const vertices = [_]Vec3{
+        .{ .x = 0.0, .y = 0.0, .z = 0.0 }, // v0
+        .{ .x = 1.0, .y = 0.0, .z = 0.0 }, // v1
+        .{ .x = 0.5, .y = 1.0, .z = 0.0 }, // v2
     };
 
-    var vertex_buf = try device.createBuffer(f32, vertices.len, .{});
+    const vertex_buf = try device.createBuffer(Vec3, vertices.len, .{});
     @memcpy(vertex_buf.getHostSlice().?, &vertices);
 
-    // Create index buffer
-    const indices = [_]u32{ 0, 1, 2 };
-    var index_buf = try device.createBuffer(u32, indices.len, .{});
-    @memcpy(index_buf.getHostSlice().?, &indices);
-
-    // Triangle geometry descriptor (fluent API)
-    const triangle_geo = metal.TriangleGeometryDescriptor.init()
-        .vertexBuffer(vertex_buf, 12)
-        .indexBuffer(index_buf, .uint32)
-        .triangleCount(1);
-
-    // BLAS descriptor
-    var blas_desc = metal.PrimitiveAccelerationStructureDescriptor.init();
-    blas_desc.addGeometry(triangle_geo);
-    blas_desc.build();
-
-    // Get sizes and allocate
-    const sizes = device.accelSizes(blas_desc);
-    try std.testing.expect(sizes.acceleration_structure_size > 0);
-
-    const blas = try device.createAccelerationStructure(sizes.acceleration_structure_size);
-    const scratch = try device.createBuffer(u8, sizes.build_scratch_buffer_size, .{});
-
-    // Build using accel encoder
+    // Create BLAS with simplified API
     var cmd = try device.createCommand();
-    cmd.createAccelEncoder()
-        .build(blas, blas_desc, scratch)
-        .end();
+    const blas = cmd.buildBLAS(.{ .vertices = vertex_buf });
     device.submit(&cmd);
 
     try std.testing.expect(blas.size() > 0);
@@ -469,14 +437,13 @@ test "texture_2d" {
     input_tex.upload(&pixels);
 
     var cmd = try device.createCommand();
-    cmd.createComputeEncoder(.{})
-        .dispatch2d(pipeline, width, height, .{
-            .textures = .{
-                .{ .tex = input_tex, .index = 0 },
-                .{ .tex = output_tex, .index = 1 },
-            },
-        })
-        .end();
+    var enc = cmd.createComputeEncoder(.{});
+    enc.dispatch2d(pipeline, width, height, .{
+        .textures = .{
+            .{ .tex = input_tex, .index = 0 },
+            .{ .tex = output_tex, .index = 1 },
+        },
+    }).end();
     device.submit(&cmd);
 
     // Verify inversion (white -> black)
@@ -522,15 +489,14 @@ test "buffers_convenience" {
     }
 
     var cmd = try device.createCommand();
-    cmd.createComputeEncoder(.{})
-        .dispatch1d(pipeline, count, .{
-            .buffers = .{
-                .{ .buf = buf_a, .index = 0 },
-                .{ .buf = buf_b, .index = 1 },
-                .{ .buf = buf_c, .index = 2 },
-            },
-        })
-        .end();
+    var enc = cmd.createComputeEncoder(.{});
+    enc.dispatch1d(pipeline, count, .{
+        .buffers = .{
+            .{ .buf = buf_a, .index = 0 },
+            .{ .buf = buf_b, .index = 1 },
+            .{ .buf = buf_c, .index = 2 },
+        },
+    }).end();
     device.submit(&cmd);
 
     const c = buf_c.getHostSlice().?;

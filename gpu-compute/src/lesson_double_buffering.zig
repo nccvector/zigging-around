@@ -108,23 +108,20 @@ pub fn main() !void {
         var cmd = try device.createCommand();
         {
             // Copy data host -> device
-            cmd.createBlitEncoder()
-                .copy(staging[buf_idx], gpu_buffer)
-                .end();
+            var blit1 = cmd.createBlitEncoder();
+            blit1.copy(staging[buf_idx], gpu_buffer).end();
 
             // Compute
             const frame_num: u32 = @intCast(i);
-            cmd.createComputeEncoder(.{})
-                .dispatch1d(pipeline, BUFFER_SIZE, .{
-                    .buffers = .{.{ .buf = gpu_buffer, .index = 0 }},
-                    .bytes = .{.{ .data = &frame_num, .index = 1 }},
-                })
-                .end();
+            var comp = cmd.createComputeEncoder(.{});
+            comp.dispatch1d(pipeline, BUFFER_SIZE, .{
+                .buffers = .{.{ .buf = gpu_buffer, .index = 0 }},
+                .bytes = .{.{ .data = &frame_num, .index = 1 }},
+            }).end();
 
             // Copy data device -> host
-            cmd.createBlitEncoder()
-                .copy(gpu_buffer, staging[buf_idx])
-                .end();
+            var blit2 = cmd.createBlitEncoder();
+            blit2.copy(gpu_buffer, staging[buf_idx]).end();
         }
 
         fences[buf_idx] = device.submitAsync(&cmd);
